@@ -1,0 +1,204 @@
+<!doctype html>
+<html lang="ja">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="theme-color" content="#0c1424">
+    <title>HID Hub Connect — 設定</title>
+    <link rel="stylesheet" href="./styles.css">
+  </head>
+  <body>
+    <main class="app-shell">
+      <header class="topbar">
+        <div>
+          <p class="eyebrow">ESP32-S3 · 設定画面</p>
+          <h1>HID Hub <span>Connect</span></h1>
+          <p class="lede">PC への出力先と、キーボード／マウスの登録をひとつの画面で確認します。</p>
+        </div>
+        <div class="connection-controls" aria-label="シリアル接続">
+          <div id="connectionPill" class="connection-pill" data-state="disconnected">
+            <span class="status-dot" aria-hidden="true"></span>
+            <span id="connectionLabel">設定画面未接続</span>
+          </div>
+          <button id="connectButton" class="button button-primary" type="button">UART USBに接続</button>
+          <button id="disconnectButton" class="button button-ghost" type="button" disabled>切断</button>
+          <button id="demoButton" class="button button-soft" type="button">デモを開く</button>
+        </div>
+      </header>
+
+      <section id="modeNotice" class="mode-notice" role="status" aria-live="polite">
+        <span class="notice-icon" aria-hidden="true">◎</span>
+        <div>
+          <strong id="modeTitle">設定画面と本体が未接続</strong>
+          <p id="modeDescription">基板写真の向きで右側にある UART USB ポートをPCへ接続し、「UART USBに接続」を押してください。</p>
+        </div>
+      </section>
+
+      <section id="operationStrip" class="operation-strip" aria-labelledby="operationTitle">
+        <div class="strip-heading">
+          <span class="section-kicker">本体の操作状態</span>
+          <span id="operationStateBadge" class="state-badge">状態不明</span>
+        </div>
+        <div class="operation-main">
+          <div>
+            <h2 id="operationTitle">本体の状態を取得できません</h2>
+            <p id="operationDetail">接続後に本体の状態を読み込みます。画面側で状態を推測することはありません。</p>
+          </div>
+          <div class="operation-meta">
+            <span id="remainingTime" class="remaining-time" aria-label="残り時間"></span>
+            <button id="cancelButton" class="button button-warning" type="button" hidden>中止</button>
+          </div>
+        </div>
+        <div id="resultMessage" class="result-message" hidden></div>
+      </section>
+
+      <section class="content-section" aria-labelledby="pcHeading">
+        <div class="section-heading">
+          <div>
+            <p class="section-kicker">出力先</p>
+            <h2 id="pcHeading">PC 3台</h2>
+          </div>
+          <p class="section-help">選択したPCへ、登録済みの入力をまとめて送ります。</p>
+        </div>
+        <div id="pcCards" class="card-grid pc-grid"></div>
+      </section>
+
+      <section class="content-section" aria-labelledby="inputHeading">
+        <div class="section-heading">
+          <div>
+            <p class="section-kicker">入力の登録枠</p>
+            <h2 id="inputHeading">キーボード 1・2 ／ マウス 1・2</h2>
+          </div>
+          <p class="section-help">枠の種類と番号を指定して登録します。複合HIDは対応機能を維持します。</p>
+        </div>
+        <div id="inputCards" class="card-grid input-grid"></div>
+      </section>
+
+      <section id="candidateSection" class="candidate-section" aria-labelledby="candidateHeading" hidden>
+        <div class="section-heading">
+          <div>
+            <p class="section-kicker">登録候補</p>
+            <h2 id="candidateHeading">入力機器を選択</h2>
+          </div>
+          <p class="section-help">候補IDは今回の登録操作の間だけ有効です。種類は接続して確認します。</p>
+        </div>
+        <div id="candidateCards" class="candidate-grid"></div>
+      </section>
+
+      <section id="legacySection" class="content-section legacy-section" aria-labelledby="legacyHeading" hidden>
+        <div class="section-heading">
+          <div>
+            <p class="section-kicker">旧形式の登録</p>
+            <h2 id="legacyHeading">割当待ちの入力</h2>
+          </div>
+          <p class="section-help">種類が確定していない旧登録は、勝手に枠へ移しません。ここから明示的に割り当てます。</p>
+        </div>
+        <div id="legacyCards" class="legacy-grid"></div>
+      </section>
+
+      <section class="content-section config-section" aria-labelledby="configHeading">
+        <div class="section-heading">
+          <div><p class="section-kicker">配列と接続先の設定</p><h2 id="configHeading">入力機器とPCを別々に設定</h2></div>
+          <p id="configAvailability" class="section-help">本体から設定を読み込みます。</p>
+        </div>
+        <p class="config-note">全キーボード・マウスの転送先は選択中のPCです。入力配列は機器が送るUS/JIS、PC配列はPC側で現在設定されているUS/JISを指定してください。</p>
+        <p class="config-note">OSは保存・表示のみ対応しています。自動判定やOSに応じたキー動作の変更は今後の実装です。配列の変換はUS/JIS設定に従います。</p>
+        <div id="pcConfig" class="config-grid"></div>
+        <h3 class="config-input-heading">入力機器の配列</h3>
+        <p class="config-note">配列は物理枠に保存します。K1/K2との対応を確認して設定してください。複合HIDのキーボード機能にも使います。</p>
+        <div id="inputConfig" class="config-grid"></div>
+      </section>
+
+      <section class="lower-grid" aria-label="LED表示と操作">
+        <article class="panel led-panel">
+          <div class="panel-heading">
+            <div>
+              <p class="section-kicker">本体LED</p>
+              <h2>光り方のプレビュー</h2>
+            </div>
+            <span id="ledSource" class="small-label">本体状態に連動</span>
+          </div>
+          <div class="led-preview">
+            <div id="ledOrb" class="led-orb" aria-label="LEDプレビュー"></div>
+            <div>
+              <strong id="ledPatternName">本体未接続</strong>
+              <p id="ledPatternDetail">接続すると、現在の本体状態に対応したパターンになります。</p>
+            </div>
+          </div>
+          <div class="demo-controls" aria-labelledby="demoControlsHeading">
+            <div class="demo-controls-heading">
+              <h3 id="demoControlsHeading">デモ用のLEDパターン</h3>
+              <span>送信しません</span>
+            </div>
+            <div class="pattern-buttons">
+              <button class="button button-chip" type="button" data-pattern="pc1">PC1</button>
+              <button class="button button-chip" type="button" data-pattern="input-k1">入力 K1</button>
+              <button class="button button-chip" type="button" data-pattern="input-k2">入力 K2</button>
+              <button class="button button-chip" type="button" data-pattern="input-m1">入力 M1</button>
+              <button class="button button-chip" type="button" data-pattern="input-m2">入力 M2</button>
+              <button class="button button-chip" type="button" data-pattern="pairing">登録中</button>
+              <button class="button button-chip" type="button" data-pattern="confirm">入れ替え確認</button>
+              <button class="button button-chip" type="button" data-pattern="success">成功</button>
+              <button class="button button-chip" type="button" data-pattern="failure">失敗</button>
+            </div>
+          </div>
+          <div class="legend-grid" aria-label="LED凡例">
+            <div><span class="swatch swatch-pc1"></span><span>PC1</span><small>赤</small></div>
+            <div><span class="swatch swatch-pc2"></span><span>PC2</span><small>緑</small></div>
+            <div><span class="swatch swatch-pc3"></span><span>PC3</span><small>青</small></div>
+            <div><span class="swatch swatch-kbd"></span><span>入力枠</span><small>黄／水色・1〜4回</small></div>
+            <div><span class="swatch swatch-confirm"></span><span>入れ替え確認</span><small>紫</small></div>
+            <div><span class="swatch swatch-result"></span><span>結果</span><small>白</small></div>
+          </div>
+        </article>
+
+        <article class="panel rules-panel">
+          <div class="panel-heading">
+            <div>
+              <p class="section-kicker">操作のルール</p>
+              <h2>安全に登録するために</h2>
+            </div>
+          </div>
+          <ul class="rule-list">
+            <li><span class="rule-mark">01</span><span><strong>入れ替え</strong>は古い登録をすぐに消さず、本体の確認状態を待ちます。</span></li>
+            <li><span class="rule-mark">02</span><span><strong>登録解除・全消去</strong>は確認ダイアログの後にだけ送信します。</span></li>
+            <li><span class="rule-mark">03</span><span>接続が切れると、直前の接続状態は画面から消えます。</span></li>
+          </ul>
+          <button id="forgetAllButton" class="button button-danger-outline" type="button" disabled>全登録を解除…</button>
+        </article>
+      </section>
+
+      <section class="log-panel" aria-labelledby="logHeading">
+        <div class="panel-heading">
+          <div>
+            <p class="section-kicker">通信ログ</p>
+            <h2 id="logHeading">UARTの応答</h2>
+          </div>
+          <button id="clearLogButton" class="text-button" type="button">消去</button>
+        </div>
+        <ol id="eventLog" class="event-log" aria-live="polite" aria-label="UARTイベントログ">
+          <li class="log-empty">接続すると、JSON応答とログをここに表示します。</li>
+        </ol>
+      </section>
+
+      <footer class="footer-note">
+        <span>本体の状態を正として表示します。</span>
+        <span>設定画面 · UART USB</span>
+      </footer>
+    </main>
+
+    <dialog id="confirmDialog" class="confirm-dialog" aria-labelledby="dialogTitle" aria-describedby="dialogMessage">
+      <form method="dialog" id="confirmForm">
+        <p class="section-kicker">確認が必要です</p>
+        <h2 id="dialogTitle">この操作を続けますか？</h2>
+        <p id="dialogMessage"></p>
+        <div class="dialog-actions">
+          <button id="dialogCancel" class="button button-ghost" value="cancel" type="submit">キャンセル</button>
+          <button id="dialogConfirm" class="button button-danger" value="confirm" type="submit">解除する</button>
+        </div>
+      </form>
+    </dialog>
+
+    <script type="module" src="./app.js"></script>
+  </body>
+</html>

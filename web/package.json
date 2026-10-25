@@ -1,0 +1,9 @@
+{
+  "name": "hid-hub-connect-web",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test protocol.test.js",
+    "build": "node build.mjs"
+  }
+}
