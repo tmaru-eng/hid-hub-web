@@ -8,6 +8,9 @@ import {
   INPUT_KEYS,
   LAYOUTS,
   HOST_OS,
+  BUTTON_ORDER_PRESETS,
+  buttonOrderChoices,
+  buttonOrderLabel,
   rgbAt,
   SerialClient,
   buildCommand,
@@ -19,10 +22,11 @@ const PATTERNS = Object.freeze({
   pc1: { name: 'PC1', detail: '赤・選択中のPC', ledState: { state: 'normal', selectedPc: 1, registered: true, connected: true } },
   pc2: { name: 'PC2', detail: '緑・選択中のPC', ledState: { state: 'normal', selectedPc: 2, registered: true, connected: true } },
   pc3: { name: 'PC3', detail: '青・選択中のPC', ledState: { state: 'normal', selectedPc: 3, registered: true, connected: true } },
-  'input-k1': { name: 'キーボード1', detail: '黄・1回短点滅', ledState: { state: 'select-input', target: 'k1' } },
-  'input-k2': { name: 'キーボード2', detail: '黄・2回短点滅', ledState: { state: 'select-input', target: 'k2' } },
-  'input-m1': { name: 'マウス1', detail: '水色・3回短点滅', ledState: { state: 'select-input', target: 'm1' } },
-  'input-m2': { name: 'マウス2', detail: '水色・4回短点滅', ledState: { state: 'select-input', target: 'm2' } },
+  'select-slot': { name: '入力枠を選択中', detail: '水色でゆっくり明暗', ledState: { state: 'select-slot' } },
+  'input-k1': { name: 'キーボード1 登録中', detail: '黄・1回短点滅＋長点灯', ledState: { state: 'pairing', target: 'k1' } },
+  'input-k2': { name: 'キーボード2 登録中', detail: '黄・2回短点滅＋長点灯', ledState: { state: 'pairing', target: 'k2' } },
+  'input-m1': { name: 'マウス1 登録中', detail: '水色・3回短点滅＋長点灯', ledState: { state: 'pairing', target: 'm1' } },
+  'input-m2': { name: 'マウス2 登録中', detail: '水色・4回短点滅＋長点灯', ledState: { state: 'pairing', target: 'm2' } },
   pairing: { name: '登録中', detail: '対象の短点滅群に続く長点灯', ledState: { state: 'pairing', target: 'k1' } },
   confirm: { name: '入れ替え確認', detail: '対象の表示に続く紫の長点灯', ledState: { state: 'confirm', target: 'pc2' } },
   success: { name: '登録成功', detail: '白を600ms点灯して通常表示へ', ledState: { state: 'success', previous: { state: 'normal', selectedPc: 1, registered: true, connected: true } } },
@@ -60,7 +64,7 @@ function makeDemoStatus() {
       { id: 'm2', slot: null, registered: false, connected: false, name: null },
     ],
     legacyInputs: [{ slot: 4, registered: true, connected: false }],
-    config: { inputLayouts: ['us', 'us', 'us', 'jis'], outputLayouts: ['us', 'jis', 'us'], outputOs: ['macos', 'windows', 'unspecified'] },
+    config: { inputLayouts: ['us', 'us', 'us', 'jis'], outputLayouts: ['us', 'jis', 'us'], outputOs: ['macos', 'windows', 'unspecified'], buttonOrder: '123M' },
     ui: { state: 'normal', target: null, operation: null, remainingMs: 0, result: '', resultRemainingMs: 0, confirmationId: 0 },
   };
 }
@@ -210,6 +214,11 @@ function renderOperation() {
   } else if (ui.state === 'normal') {
     title.textContent = `通常表示 · 選択中 ${formatTarget(`pc${status.selectedPc}`)}`;
     detail.textContent = 'PCの短押しは出力先を選択し、入力はそのPCへまとめて送られます。';
+  } else if (ui.state === 'select-slot') {
+    title.textContent = '入力枠を選択中';
+    detail.textContent = 'MODEを離し、PC1・PC2・PC3・MODEのボタンでK1・K2・M1・M2を選んでください。登録済みの枠は確認なしで入れ替えます。';
+    if (ui.remainingMs > 0) remaining.textContent = formatDuration(ui.remainingMs);
+    cancel.hidden = mode === 'demo';
   } else if (ui.state === 'confirm') {
     title.textContent = `${describeUiState(ui.state)} · ${formatTarget(ui.target)}`;
     detail.textContent = '確認して続けると古い登録を削除し、新しい登録待ちになります。失敗・中止の場合は未登録のままです。PC側で再ペアリングが必要になる場合があります。';
@@ -396,19 +405,20 @@ function makeConfigField(parent, scope, slot, field, label, choices) {
   caption.textContent = label;
   const select = document.createElement('select');
   select.id = caption.htmlFor;
-  select.setAttribute('aria-label', `${scope === 'pc' ? 'PC' : '物理枠'}${slot}の${label}`);
+  const controlLabel = scope === 'buttons' ? label : `${scope === 'pc' ? 'PC' : '物理枠'}${slot}の${label}`;
+  select.setAttribute('aria-label', controlLabel);
   for (const value of choices) {
     const option = document.createElement('option');
     option.value = value;
-    option.textContent = CONFIG_LABELS[value];
+    option.textContent = scope === 'buttons' ? buttonOrderLabel(value) : CONFIG_LABELS[value];
     select.append(option);
   }
   const current = document.createElement('span');
   current.className = 'config-current';
   const control = { scope, slot, field, select, current, saved: null, dirty: false, button: null };
   const button = makeButton('保存', 'button-soft', {
-    ariaLabel: `${scope === 'pc' ? 'PC' : '物理枠'}${slot}の${label}を保存`,
-    onClick: () => sendCommand(buildCommand('set', scope, slot, field, select.value), `${label}を保存`),
+    ariaLabel: `${controlLabel}を保存`,
+    onClick: () => sendCommand(scope === 'buttons' ? buildCommand('set-buttons', select.value) : buildCommand('set', scope, slot, field, select.value), `${label}を保存`),
   });
   control.button = button;
   select.addEventListener('change', () => { control.dirty = select.value !== control.saved; renderConfiguration(); });
@@ -418,6 +428,10 @@ function makeConfigField(parent, scope, slot, field, label, choices) {
 }
 
 function initConfiguration() {
+  const buttonPanel = document.createElement('article');
+  buttonPanel.className = 'panel config-card';
+  makeConfigField(buttonPanel, 'buttons', 0, 'order', 'ボタンの並び', BUTTON_ORDER_PRESETS);
+  $('buttonConfig').append(buttonPanel);
   for (let slot = 1; slot <= 3; slot += 1) {
     const panel = document.createElement('article');
     panel.className = 'panel config-card';
@@ -450,7 +464,19 @@ function renderConfiguration() {
   }
   for (const control of configControls.values()) {
     const values = control.scope === 'input' ? config?.inputLayouts : control.field === 'os' ? config?.outputOs : config?.outputLayouts;
-    const saved = values?.[control.slot - 1] ?? null;
+    const saved = control.scope === 'buttons' ? config?.buttonOrder ?? null : values?.[control.slot - 1] ?? null;
+    if (control.scope === 'buttons') {
+      const custom = control.select.querySelector('[data-custom-order]');
+      const customValue = buttonOrderChoices(saved)[2] ?? null;
+      if (custom && custom.value !== customValue) custom.remove();
+      if (customValue && !control.select.querySelector('[data-custom-order]')) {
+        const option = document.createElement('option');
+        option.dataset.customOrder = '';
+        option.value = customValue;
+        option.textContent = buttonOrderLabel(customValue);
+        control.select.append(option);
+      }
+    }
     if (saved === null) {
       control.dirty = false;
       control.select.selectedIndex = -1;
@@ -459,8 +485,9 @@ function renderConfiguration() {
       control.dirty = false;
     }
     control.saved = saved;
-    control.current.textContent = saved === null ? '保存値は不明' : `本体の保存値: ${CONFIG_LABELS[saved]}${control.dirty ? ' · 未保存の変更あり' : ''}`;
-    const disabled = !canSend() || !config || status.ui.state !== 'normal';
+    const savedLabel = control.scope === 'buttons' ? buttonOrderLabel(saved) : CONFIG_LABELS[saved];
+    control.current.textContent = saved === null ? '保存値は不明' : `本体の保存値: ${savedLabel}${control.dirty ? ' · 未保存の変更あり' : ''}`;
+    const disabled = !canSend() || !config || status.ui.state !== 'normal' || (control.scope === 'buttons' && saved === null);
     control.select.disabled = disabled;
     control.button.disabled = disabled || !control.dirty;
   }
@@ -616,8 +643,8 @@ function renderLed() {
     setLed('confirm', { state: 'confirm', target: ui.target });
   } else if (ui.state === 'pairing') {
     setLed('pairing', { state: 'pairing', target: ui.target });
-  } else if (ui.state === 'select-input') {
-    setLed(`input-${ui.target}`, { state: 'select-input', target: ui.target });
+  } else if (ui.state === 'select-slot') {
+    setLed('select-slot', { state: 'select-slot' });
   } else {
     setLed(`pc${status.selectedPc}`, previous);
   }

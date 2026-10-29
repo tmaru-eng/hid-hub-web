@@ -14,6 +14,8 @@ import {
   SerialCommandWriter,
   STATUS_STALE_AFTER_MS,
   buildCommand,
+  buttonOrderChoices,
+  buttonOrderLabel,
   normalizeStatus,
   rgbAt,
 } from './protocol.js';
@@ -22,12 +24,12 @@ const status = {
   protocol: 2,
   selectedPc: 2,
   pcs: [
-    { registered: true, connected: true, name: null },
+    { registered: true, connected: true, name: null, intervalUs: 11250 },
     { registered: false, connected: false, name: null },
     { registered: true, connected: false, name: 'Office' },
   ],
   inputs: [
-    { id: 'k1', slot: 1, registered: true, connected: true, name: null },
+    { id: 'k1', slot: 1, registered: true, connected: true, name: null, intervalUs: 7500 },
     { id: 'k2', slot: null, registered: false, connected: false, name: null },
     { id: 'm1', slot: 3, registered: true, connected: false, name: null },
     { id: 'm2', slot: null, registered: false, connected: false, name: null },
@@ -140,6 +142,39 @@ test('normalizeStatus validates protocol v2 while preserving null names', () => 
   }), /confirmationId/i);
 });
 
+test('normalizeStatus preserves optional fast interval status for PCs and mouse inputs', () => {
+  const pcFast = {
+    stage: 0,
+    targetUnits: 6,
+    attempts: 2,
+    pending: true,
+    requestRc: 0,
+    lastUpdate: { status: 0, intervalUs: 15000 },
+  };
+  const inputFast = {
+    stage: 1,
+    targetUnits: 12,
+    attempts: 3,
+    pending: false,
+    requestRc: -8,
+    lastUpdate: { status: -8, intervalUs: 15000 },
+    peerRequests: {
+      connUpdateReq: { count: 2, minUnits: 12, maxUnits: 24 },
+      l2capUpdateReq: { count: 1, minUnits: 12, maxUnits: 18 },
+    },
+  };
+  const normalized = normalizeStatus({
+    ...status,
+    pcs: status.pcs.map((entry, index) => index === 0 ? { ...entry, fast: pcFast } : entry),
+    inputs: status.inputs.map((entry, index) => index === 2 ? { ...entry, fast: inputFast } : entry),
+  });
+
+  assert.deepEqual(normalized.pcs[0].fast, pcFast);
+  assert.deepEqual(normalized.inputs[2].fast, inputFast);
+  assert.equal(normalized.inputs[0].fast, undefined);
+  assert.equal(normalizeStatus(status).pcs[0].fast, undefined, 'status from older firmware remains valid');
+});
+
 test('normalizeStatus accepts bounded candidates with a positive generation', () => {
   const withCandidates = normalizeStatus({
     ...status,
@@ -161,7 +196,7 @@ test('normalizeStatus accepts bounded candidates with a positive generation', ()
 });
 
 test('user-facing mappers hide protocol error and operation codes', () => {
-  assert.equal(describeUiState('select-input'), '入力枠を選択中');
+  assert.equal(describeUiState('select-slot'), '入力枠を選択中');
   assert.equal(describeOperation('pair'), '登録');
   assert.equal(describeOperation('forget'), '登録解除');
   assert.equal(describeResult('success'), '処理が完了しました。');
@@ -216,17 +251,20 @@ test('buildCommand emits exact v2 commands and rejects injection', () => {
   assert.throws(() => buildCommand('confirm', '1\nstatus'), /confirmation/i);
 });
 
-test('rgbAt renders input slot counts as distinct 150ms pulses', () => {
-  assert.deepEqual(rgbAt({ state: 'select-input', target: 'k1' }, 0), LED_COLORS.keyboard);
-  assert.deepEqual(rgbAt({ state: 'select-input', target: 'k1' }, 149), LED_COLORS.keyboard);
-  assert.deepEqual(rgbAt({ state: 'select-input', target: 'k1' }, 150), LED_COLORS.off);
-  assert.deepEqual(rgbAt({ state: 'select-input', target: 'k1' }, 300), LED_COLORS.off);
-
-  assert.deepEqual(rgbAt({ state: 'select-input', target: 'k2' }, 300), LED_COLORS.keyboard);
-  assert.deepEqual(rgbAt({ state: 'select-input', target: 'k2' }, 600), LED_COLORS.off);
-  assert.deepEqual(rgbAt({ state: 'select-input', target: 'm1' }, 600), LED_COLORS.mouse);
-  assert.deepEqual(rgbAt({ state: 'select-input', target: 'm2' }, 900), LED_COLORS.mouse);
-  assert.deepEqual(rgbAt({ state: 'select-input', target: 'm2' }, 1200), LED_COLORS.off);
+test('slot selection breathes in cyan, while each input pairing retains its pulse count', () => {
+  assert.deepEqual(rgbAt({ state: 'select-slot' }, 0), LED_COLORS.off);
+  assert.deepEqual(rgbAt({ state: 'select-slot' }, 500), [0, 12, 12]);
+  assert.deepEqual(rgbAt({ state: 'select-slot' }, 1000), LED_COLORS.mouse);
+  assert.deepEqual(rgbAt({ state: 'select-slot' }, 1500), [0, 12, 12]);
+  for (const [target, count, color] of [['k1', 1, LED_COLORS.keyboard], ['k2', 2, LED_COLORS.keyboard], ['m1', 3, LED_COLORS.mouse], ['m2', 4, LED_COLORS.mouse]]) {
+    const state = { state: 'pairing', target };
+    assert.deepEqual(rgbAt(state, (count - 1) * 300), color);
+    assert.deepEqual(rgbAt(state, count * 300), LED_COLORS.off);
+    assert.deepEqual(rgbAt(state, (count + 1) * 300), color);
+  }
+  const selection = normalizeStatus({ ...status, ui: { ...status.ui, state: 'select-slot', target: null, remainingMs: 8000 } });
+  assert.equal(selection.ui.state, 'select-slot');
+  assert.equal(selection.ui.target, null);
 });
 
 test('rgbAt keeps target and purple confirmation phases coherent', () => {
@@ -361,11 +399,40 @@ test('SerialClient clears stale state when the read loop closes unexpectedly', a
 
 test('configuration status preserves independent PC OS and layout and four physical layouts', () => {
   const config = { inputLayouts: ['us', 'jis', 'us', 'jis'], outputLayouts: ['jis', 'us', 'us'], outputOs: ['windows', 'macos', 'unspecified'] };
-  assert.deepEqual(normalizeStatus({ ...status, config }).config, config);
+  assert.deepEqual(normalizeStatus({ ...status, config }).config, { ...config, buttonOrder: null });
   assert.equal(normalizeStatus(status).config, null, 'old firmware must not invent saved settings');
   for (const bad of [ { ...config, outputOs: ['auto', 'macos', 'linux'] }, { ...config, inputLayouts: ['us'] }, { ...config, outputLayouts: ['us', 'jis', 'dvorak'] } ]) {
     assert.throws(() => normalizeStatus({ ...status, config: bad }));
   }
+});
+
+test('button order status retains valid custom orders and handles older firmware', () => {
+  const config = { inputLayouts: ['us', 'jis', 'us', 'jis'], outputLayouts: ['jis', 'us', 'us'], outputOs: ['windows', 'macos', 'unspecified'] };
+  assert.equal(normalizeStatus({ ...status, config }).config.buttonOrder, null);
+  for (const order of ['123M', 'M321', '2M13']) {
+    assert.equal(normalizeStatus({ ...status, config: { ...config, buttonOrder: order } }).config.buttonOrder, order);
+  }
+  for (const order of ['112M', '1234', 'M321x', 'm321', null, 1234]) {
+    assert.throws(() => normalizeStatus({ ...status, config: { ...config, buttonOrder: order } }), /buttonOrder/);
+  }
+});
+
+test('button order commands validate permutations and supported aliases', () => {
+  for (const order of ['123M', 'M321', '2M13', 'normal', 'reversed']) {
+    assert.equal(buildCommand('set-buttons', order), `set buttons ${order}`);
+  }
+  for (const order of ['112M', '1234', 'M321x', 'm321', '', '123M\nforget all']) {
+    assert.throws(() => buildCommand('set-buttons', order));
+  }
+  assert.throws(() => buildCommand('set-buttons', '123M', 'extra'));
+});
+
+test('button order choices display presets and preserve a custom saved value', () => {
+  assert.deepEqual(buttonOrderChoices('123M'), ['123M', 'M321']);
+  assert.deepEqual(buttonOrderChoices('2M13'), ['123M', 'M321', '2M13']);
+  assert.equal(buttonOrderLabel('123M'), '標準（123M）');
+  assert.equal(buttonOrderLabel('M321'), '逆（M321）');
+  assert.equal(buttonOrderLabel('2M13'), '2M13');
 });
 
 test('configuration commands validate layouts, destination OS, and physical input slots', () => {

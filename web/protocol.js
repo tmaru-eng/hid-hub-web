@@ -39,12 +39,12 @@ export const LED_TIMING = Object.freeze({
   resultFlashOffMs: 100,
 });
 
-const UI_STATES = new Set(['normal', 'select-input', 'confirm', 'pairing']);
+const UI_STATES = new Set(['normal', 'select-slot', 'confirm', 'pairing']);
 const OPERATIONS = new Set(['pair', 'forget', 'clear', null]);
 const TARGETS = new Set(['pc1', 'pc2', 'pc3', ...INPUT_KEYS, 'all', null]);
 const USER_STATE_LABELS = Object.freeze({
   normal: '待機中',
-  'select-input': '入力枠を選択中',
+  'select-slot': '入力枠を選択中',
   confirm: '入れ替え確認待ち',
   pairing: '登録処理中',
 });
@@ -172,6 +172,44 @@ function assertInteger(value, label, minimum, maximum) {
   return value;
 }
 
+function nullableInteger(value, label, minimum, maximum) {
+  return value === null ? null : assertInteger(value, label, minimum, maximum);
+}
+
+function normalizePeerRequest(entry, label) {
+  assertObject(entry, label);
+  return {
+    count: assertInteger(entry.count, `${label}.count`, 0, Number.MAX_SAFE_INTEGER),
+    minUnits: nullableInteger(entry.minUnits, `${label}.minUnits`, 0, 0xffff),
+    maxUnits: nullableInteger(entry.maxUnits, `${label}.maxUnits`, 0, 0xffff),
+  };
+}
+
+function normalizeFast(entry, label) {
+  if (entry === null) return null;
+  assertObject(entry, label);
+  assertObject(entry.lastUpdate, `${label}.lastUpdate`);
+  const normalized = {
+    stage: nullableInteger(entry.stage, `${label}.stage`, 0, 0xff),
+    targetUnits: assertInteger(entry.targetUnits, `${label}.targetUnits`, 0, 0xffff),
+    attempts: assertInteger(entry.attempts, `${label}.attempts`, 0, 0xff),
+    pending: assertBoolean(entry.pending, `${label}.pending`),
+    requestRc: nullableInteger(entry.requestRc, `${label}.requestRc`, -0x80000000, 0x7fffffff),
+    lastUpdate: {
+      status: nullableInteger(entry.lastUpdate.status, `${label}.lastUpdate.status`, -0x80000000, 0x7fffffff),
+      intervalUs: nullableInteger(entry.lastUpdate.intervalUs, `${label}.lastUpdate.intervalUs`, 0, 0xffffffff),
+    },
+  };
+  if (entry.peerRequests !== undefined) {
+    assertObject(entry.peerRequests, `${label}.peerRequests`);
+    normalized.peerRequests = {
+      connUpdateReq: normalizePeerRequest(entry.peerRequests.connUpdateReq, `${label}.peerRequests.connUpdateReq`),
+      l2capUpdateReq: normalizePeerRequest(entry.peerRequests.l2capUpdateReq, `${label}.peerRequests.l2capUpdateReq`),
+    };
+  }
+  return normalized;
+}
+
 function normalizeDevice(entry, label, expectedId = undefined) {
   assertObject(entry, label);
   if (expectedId !== undefined && entry.id !== expectedId) {
@@ -185,6 +223,7 @@ function normalizeDevice(entry, label, expectedId = undefined) {
     registered: entry.registered,
     connected: entry.connected,
     name: entry.name,
+    ...(entry.fast === undefined ? {} : { fast: normalizeFast(entry.fast, `${label}.fast`) }),
   };
 }
 
@@ -249,6 +288,22 @@ function normalizeUi(value) {
 
 export const LAYOUTS = Object.freeze(['us', 'jis']);
 export const HOST_OS = Object.freeze(['unspecified', 'windows', 'macos', 'linux']);
+export const BUTTON_ORDER_PRESETS = Object.freeze(['123M', 'M321']);
+
+function validButtonOrder(value) {
+  return typeof value === 'string' && value.length === 4 && [...value].sort().join('') === '123M';
+}
+
+export function buttonOrderLabel(value) {
+  return value === '123M' ? '標準（123M）' : value === 'M321' ? '逆（M321）' : value;
+}
+
+/** Include a saved custom order so it stays visible until the user changes it. */
+export function buttonOrderChoices(saved) {
+  return saved && validButtonOrder(saved) && !BUTTON_ORDER_PRESETS.includes(saved)
+    ? [...BUTTON_ORDER_PRESETS, saved]
+    : [...BUTTON_ORDER_PRESETS];
+}
 
 function normalizeConfig(value) {
   // Protocol v2 firmware before configuration support supplies no config.
@@ -258,7 +313,9 @@ function normalizeConfig(value) {
     if (!Array.isArray(value[key]) || value[key].length !== count || value[key].some((entry) => !choices.includes(entry))) invalid(`invalid config.${key}`);
     return [...value[key]];
   };
-  return { inputLayouts: copy('inputLayouts', PHYSICAL_INPUT_COUNT, LAYOUTS), outputLayouts: copy('outputLayouts', PC_COUNT, LAYOUTS), outputOs: copy('outputOs', PC_COUNT, HOST_OS) };
+  const buttonOrder = value.buttonOrder === undefined ? null : value.buttonOrder;
+  if (value.buttonOrder !== undefined && !validButtonOrder(buttonOrder)) invalid('invalid config.buttonOrder');
+  return { inputLayouts: copy('inputLayouts', PHYSICAL_INPUT_COUNT, LAYOUTS), outputLayouts: copy('outputLayouts', PC_COUNT, LAYOUTS), outputOs: copy('outputOs', PC_COUNT, HOST_OS), buttonOrder };
 }
 
 /** Validate and copy the complete UART protocol-v2 status object. */
@@ -478,7 +535,7 @@ function previousResultColor(state, timeMs) {
  *
  * State shapes intentionally mirror the protocol where possible:
  * `{state:'normal', selectedPc:1, registered:true, connected:true}`;
- * `{state:'select-input'|'pairing'|'confirm', target:'k1'}`;
+ * `{state:'select-slot'}` or `{state:'pairing'|'confirm', target:'k1'}`;
  * and `{state:'success'|'failure', previous:<state>}`. Time is in ms.
  */
 export function rgbAt(state, timeMs) {
@@ -496,9 +553,10 @@ export function rgbAt(state, timeMs) {
     const level = phase <= 1000 ? phase / 1000 : (2000 - phase) / 1000;
     return scaleRgb(rgb, level);
   }
-  if (mode === 'select-input') {
-    const target = targetKey(state.target);
-    return shortPulse(targetColor(target), targetCount(target), time);
+  if (mode === 'select-slot') {
+    const phase = phaseAt(time, LED_TIMING.inputSelectionPeriodMs);
+    const level = phase <= 1000 ? phase : 2000 - phase;
+    return LED_COLORS.mouse.map((channel) => Math.floor(channel * level / 1000));
   }
   if (mode === 'pairing') {
     const target = targetKey(state.target);
@@ -528,6 +586,11 @@ export function rgbAt(state, timeMs) {
 /** Build one exact, newline-free command from the UART v2 contract. */
 export function buildCommand(kind, ...args) {
   switch (kind) {
+    case 'set-buttons': {
+      const [order] = args;
+      if (args.length !== 1 || (!validButtonOrder(order) && !['normal', 'reversed'].includes(order))) invalid('invalid button order');
+      return `set buttons ${order}`;
+    }
     case 'status':
       if (args.length !== 0) invalid('status takes no arguments');
       return 'status';

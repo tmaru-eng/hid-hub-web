@@ -103,6 +103,10 @@
         </div>
         <p class="config-note">全キーボード・マウスの転送先は選択中のPCです。入力配列は機器が送るUS/JIS、PC配列はPC側で現在設定されているUS/JISを指定してください。</p>
         <p class="config-note">OSは保存・表示のみ対応しています。自動判定やOSに応じたキー動作の変更は今後の実装です。配列の変換はUS/JIS設定に従います。</p>
+        <h3 class="config-input-heading">本体のボタン</h3>
+        <p class="config-note">GPIO4・5・6・7の順に、PC1・PC2・PC3・MODEの役割を設定します。</p>
+        <div id="buttonConfig" class="config-grid"></div>
+        <h3 class="config-input-heading">PCの設定</h3>
         <div id="pcConfig" class="config-grid"></div>
         <h3 class="config-input-heading">入力機器の配列</h3>
         <p class="config-note">配列は物理枠に保存します。K1/K2との対応を確認して設定してください。複合HIDのキーボード機能にも使います。</p>
@@ -132,6 +136,7 @@
             </div>
             <div class="pattern-buttons">
               <button class="button button-chip" type="button" data-pattern="pc1">PC1</button>
+              <button class="button button-chip" type="button" data-pattern="select-slot">入力枠選択</button>
               <button class="button button-chip" type="button" data-pattern="input-k1">入力 K1</button>
               <button class="button button-chip" type="button" data-pattern="input-k2">入力 K2</button>
               <button class="button button-chip" type="button" data-pattern="input-m1">入力 M1</button>
@@ -146,7 +151,7 @@
             <div><span class="swatch swatch-pc1"></span><span>PC1</span><small>赤</small></div>
             <div><span class="swatch swatch-pc2"></span><span>PC2</span><small>緑</small></div>
             <div><span class="swatch swatch-pc3"></span><span>PC3</span><small>青</small></div>
-            <div><span class="swatch swatch-kbd"></span><span>入力枠</span><small>黄／水色・1〜4回</small></div>
+            <div><span class="swatch swatch-kbd"></span><span>入力枠の登録中</span><small>黄／水色・1〜4回＋長点灯</small></div>
             <div><span class="swatch swatch-confirm"></span><span>入れ替え確認</span><small>紫</small></div>
             <div><span class="swatch swatch-result"></span><span>結果</span><small>白</small></div>
           </div>
