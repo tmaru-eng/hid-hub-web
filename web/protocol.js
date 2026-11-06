@@ -10,6 +10,15 @@ export const INPUT_KEYS = Object.freeze(['k1', 'k2', 'm1', 'm2']);
 export const PC_COUNT = 3;
 export const PHYSICAL_INPUT_COUNT = 4;
 export const SERIAL_BAUD_RATE = 115200;
+export const BLE_CONFIG_SERVICE_UUID = 'f702bda5-2d20-4f9b-97de-1074f69db11a';
+export const BLE_CONFIG_RX_UUID = 'f702bda6-2d20-4f9b-97de-1074f69db11a';
+export const BLE_CONFIG_TX_UUID = 'f702bda7-2d20-4f9b-97de-1074f69db11a';
+export const BLUETOOTH_NAME_PREFIX = 'HID Hub';
+export const BLUETOOTH_STATUS_POLL_INTERVAL_MS = 5000;
+export const BLUETOOTH_STATUS_STALE_AFTER_MS = 12000;
+export const BLUETOOTH_CONNECT_TIMEOUT_MS = 8000;
+export const BLUETOOTH_CONNECT_TIMEOUT_MESSAGE = '接続できませんでした。機器の一覧に HID Hub が 2 つあるときは、もう一方を選んでください。';
+export const BLUETOOTH_COMMAND_TIMEOUT_MS = 12000;
 // A UART can stay open while the board has reset or stopped answering.  Keep
 // polling so a later status can recover, but never keep showing the last
 // status beyond this bounded freshness window.
@@ -20,9 +29,10 @@ export const LED_COLORS = Object.freeze({
   pc1: Object.freeze([32, 0, 0]),
   pc2: Object.freeze([0, 32, 0]),
   pc3: Object.freeze([0, 0, 32]),
-  keyboard: Object.freeze([32, 16, 0]),
-  mouse: Object.freeze([0, 24, 24]),
-  confirm: Object.freeze([24, 0, 24]),
+  keyboard: Object.freeze([32, 32, 0]),
+  mouse: Object.freeze([32, 0, 32]),
+  selectSlot: Object.freeze([0, 24, 24]),
+  confirm: Object.freeze([24, 24, 24]),
   result: Object.freeze([24, 24, 24]),
 });
 
@@ -67,6 +77,7 @@ const USER_RESULT_LABELS = Object.freeze({
   confirmation_timeout: '確認の時間が切れました。登録は変更していません。',
   timeout: '時間切れです。登録は完了していません。',
   timed_out: '時間切れです。登録は完了していません。',
+  'bond-store-full': '本体のbond保存領域が満杯です。新しい登録は完了せず、以前の登録は保持されています。',
   failure: '処理に失敗しました。',
   failed: '処理に失敗しました。',
   error: '処理に失敗しました。',
@@ -141,7 +152,7 @@ export function describeError(value) {
 export function classifyResult(value) {
   const code = normalizedCode(value);
   if (code === 'success') return 'success';
-  if (['failure', 'failed', 'error', 'timeout', 'timed_out', 'busy'].includes(code)) return 'failure';
+  if (['failure', 'failed', 'error', 'timeout', 'timed_out', 'busy', 'bond-store-full'].includes(code)) return 'failure';
   if (['cancel', 'cancelled', 'canceled', 'aborted', 'confirmation-timeout', 'confirmation_timeout'].includes(code)) return 'cancelled';
   return 'none';
 }
@@ -223,6 +234,15 @@ function normalizeDevice(entry, label, expectedId = undefined) {
     registered: entry.registered,
     connected: entry.connected,
     name: entry.name,
+    ...(entry.intervalPolicyGaveUp === undefined
+      ? {}
+      : { intervalPolicyGaveUp: assertBoolean(entry.intervalPolicyGaveUp, `${label}.intervalPolicyGaveUp`) }),
+    ...(entry.peerIntervalRejections === undefined
+      ? {}
+      : { peerIntervalRejections: assertInteger(entry.peerIntervalRejections, `${label}.peerIntervalRejections`, 0, 0xffffffff) }),
+    ...(entry.intervalUs === undefined
+      ? {}
+      : { intervalUs: nullableInteger(entry.intervalUs, `${label}.intervalUs`, 0, 0xffffffff) }),
     ...(entry.fast === undefined ? {} : { fast: normalizeFast(entry.fast, `${label}.fast`) }),
   };
 }
@@ -243,6 +263,15 @@ function normalizeLegacyInput(entry, index) {
     slot: entry.slot,
     registered: entry.registered,
     connected: entry.connected,
+    ...(entry.intervalUs === undefined
+      ? {}
+      : { intervalUs: nullableInteger(entry.intervalUs, `legacyInputs[${index}].intervalUs`, 0, 0xffffffff) }),
+    ...(entry.intervalPolicyGaveUp === undefined
+      ? {}
+      : { intervalPolicyGaveUp: assertBoolean(entry.intervalPolicyGaveUp, `legacyInputs[${index}].intervalPolicyGaveUp`) }),
+    ...(entry.peerIntervalRejections === undefined
+      ? {}
+      : { peerIntervalRejections: assertInteger(entry.peerIntervalRejections, `legacyInputs[${index}].peerIntervalRejections`, 0, 0xffffffff) }),
   };
 }
 
@@ -287,6 +316,17 @@ function normalizeUi(value) {
 }
 
 export const LAYOUTS = Object.freeze(['us', 'jis']);
+/** Keys the firmware accepts for the Ctrl+Alt+Shift PC-switch chord. */
+export const SWITCH_KEYS = Object.freeze([
+  ...'abcdefghijklmnopqrstuvwxyz'.split(''), '1', '2', '3', '4', '5', '6', '7', '8', '9', '0',
+  'f1', 'f2', 'f3', 'f4', 'f5', 'f6', 'f7', 'f8', 'f9', 'f10', 'f11', 'f12',
+]);
+
+/** Null when the keys are valid (one allowed, distinct key per PC), else a Japanese reason. */
+export function switchKeysProblem(keys) {
+  if (!Array.isArray(keys) || keys.length !== PC_COUNT || keys.some((key) => !SWITCH_KEYS.includes(key))) return 'キーの指定が正しくありません。';
+  return new Set(keys).size === keys.length ? null : '同じキーを複数のPCに割り当てることはできません。';
+}
 export const HOST_OS = Object.freeze(['unspecified', 'windows', 'macos', 'linux']);
 export const BUTTON_ORDER_PRESETS = Object.freeze(['123M', 'M321']);
 
@@ -305,6 +345,16 @@ export function buttonOrderChoices(saved) {
     : [...BUTTON_ORDER_PRESETS];
 }
 
+export function configurationFieldPolicy(scope, transport) {
+  const requiresUsb = scope === 'buttons' && transport === 'bluetooth';
+  return {
+    disabled: requiresUsb,
+    guidance: requiresUsb
+      ? 'Bluetooth接続中はボタンの並びを変更できません。USBで接続してください。'
+      : '',
+  };
+}
+
 function normalizeConfig(value) {
   // Protocol v2 firmware before configuration support supplies no config.
   if (value === undefined) return null;
@@ -313,9 +363,20 @@ function normalizeConfig(value) {
     if (!Array.isArray(value[key]) || value[key].length !== count || value[key].some((entry) => !choices.includes(entry))) invalid(`invalid config.${key}`);
     return [...value[key]];
   };
+  const inputMacDeleteSwapSupported = value.inputMacDeleteSwap !== undefined;
+  const inputMacDeleteSwap = !inputMacDeleteSwapSupported
+    ? Array(PHYSICAL_INPUT_COUNT).fill(false)
+    : copy('inputMacDeleteSwap', PHYSICAL_INPUT_COUNT, [false, true]);
   const buttonOrder = value.buttonOrder === undefined ? null : value.buttonOrder;
   if (value.buttonOrder !== undefined && !validButtonOrder(buttonOrder)) invalid('invalid config.buttonOrder');
-  return { inputLayouts: copy('inputLayouts', PHYSICAL_INPUT_COUNT, LAYOUTS), outputLayouts: copy('outputLayouts', PC_COUNT, LAYOUTS), outputOs: copy('outputOs', PC_COUNT, HOST_OS), buttonOrder };
+  // Older firmware has no shortcutKeys; an empty list means the chord is not in per-PC key mode.
+  let shortcut = {};
+  if (value.shortcutKeys !== undefined) {
+    if (typeof value.shortcut !== 'string') invalid('invalid config.shortcut');
+    if (!Array.isArray(value.shortcutKeys) || (value.shortcutKeys.length !== 0 && switchKeysProblem(value.shortcutKeys))) invalid('invalid config.shortcutKeys');
+    shortcut = { shortcut: value.shortcut, shortcutKeys: [...value.shortcutKeys] };
+  }
+  return { inputLayouts: copy('inputLayouts', PHYSICAL_INPUT_COUNT, LAYOUTS), inputMacDeleteSwap, inputMacDeleteSwapSupported, outputLayouts: copy('outputLayouts', PC_COUNT, LAYOUTS), outputOs: copy('outputOs', PC_COUNT, HOST_OS), buttonOrder, ...shortcut };
 }
 
 /** Validate and copy the complete UART protocol-v2 status object. */
@@ -344,12 +405,16 @@ export function normalizeStatus(value) {
   const inputs = status.inputs.map(normalizeInput);
   const legacyInputs = status.legacyInputs.map(normalizeLegacyInput);
   const ui = normalizeUi(status.ui);
+  const needsReboot = status.needsReboot === undefined
+    ? false
+    : assertBoolean(status.needsReboot, 'needsReboot');
   return {
     protocol: 2,
     selectedPc: status.selectedPc,
     pcs,
     inputs,
     legacyInputs,
+    needsReboot,
     candidateGeneration,
     config: normalizeConfig(status.config),
     candidates,
@@ -448,6 +513,12 @@ export class DeviceStateStore {
     this.#notify();
   }
 
+  clearStatus() {
+    if (this.status === null) return;
+    this.status = null;
+    this.#notify();
+  }
+
   #notify() {
     const snapshot = this.snapshot();
     for (const listener of this.listeners) listener(snapshot);
@@ -483,10 +554,9 @@ function targetColor(target) {
 }
 
 function targetCount(target) {
-  if (target === 'pc1' || target === 'k1') return 1;
-  if (target === 'pc2' || target === 'k2') return 2;
-  if (target === 'pc3' || target === 'm1') return 3;
-  if (target === 'm2') return 4;
+  if (target === 'pc1' || target === 'k1' || target === 'm1') return 1;
+  if (target === 'pc2' || target === 'k2' || target === 'm2') return 2;
+  if (target === 'pc3') return 3;
   return 0;
 }
 
@@ -518,9 +588,9 @@ function targetConfirm(target, timeMs) {
   const targetRgb = targetColor(target);
   const phase = phaseAt(timeMs, LED_TIMING.registrationPeriodMs);
   const groupMs = count * (LED_TIMING.shortOnMs + LED_TIMING.shortOffMs);
-  const purpleStart = groupMs + LED_TIMING.inputRegistrationGapMs;
+  const longStart = groupMs + LED_TIMING.inputRegistrationGapMs;
   if (phase < groupMs) return shortPulse(targetRgb, count, phase, LED_TIMING.registrationPeriodMs);
-  if (phase >= purpleStart && phase < purpleStart + LED_TIMING.longOnMs) return LED_COLORS.confirm;
+  if (phase >= longStart && phase < longStart + LED_TIMING.longOnMs) return LED_COLORS.confirm;
   return LED_COLORS.off;
 }
 
@@ -556,7 +626,7 @@ export function rgbAt(state, timeMs) {
   if (mode === 'select-slot') {
     const phase = phaseAt(time, LED_TIMING.inputSelectionPeriodMs);
     const level = phase <= 1000 ? phase : 2000 - phase;
-    return LED_COLORS.mouse.map((channel) => Math.floor(channel * level / 1000));
+    return LED_COLORS.selectSlot.map((channel) => Math.floor(channel * level / 1000));
   }
   if (mode === 'pairing') {
     const target = targetKey(state.target);
@@ -591,6 +661,14 @@ export function buildCommand(kind, ...args) {
       if (args.length !== 1 || (!validButtonOrder(order) && !['normal', 'reversed'].includes(order))) invalid('invalid button order');
       return `set buttons ${order}`;
     }
+    case 'set-shortcut-keys': {
+      const [keys] = args;
+      if (args.length !== 1 || switchKeysProblem(keys)) invalid('invalid shortcut keys');
+      return `set shortcut-keys ${keys.join(',')}`;
+    }
+    case 'set-shortcut-default':
+      if (args.length !== 0) invalid('set-shortcut-default takes no arguments');
+      return 'set shortcut ctrl-alt-shift-digits';
     case 'status':
       if (args.length !== 0) invalid('status takes no arguments');
       return 'status';
@@ -598,7 +676,13 @@ export function buildCommand(kind, ...args) {
       const [scope, slot, field, value] = args;
       if (args.length !== 4 || !['pc', 'input'].includes(scope)) invalid('set requires pc/input SLOT layout/os VALUE');
       assertInteger(slot, 'slot', 1, scope === 'pc' ? PC_COUNT : PHYSICAL_INPUT_COUNT);
-      const choices = field === 'layout' ? LAYOUTS : field === 'os' && scope === 'pc' ? HOST_OS : [];
+      const choices = field === 'layout'
+        ? LAYOUTS
+        : field === 'os' && scope === 'pc'
+          ? HOST_OS
+          : field === 'mac-delete-swap' && scope === 'input'
+            ? ['on', 'off']
+            : [];
       if (!choices.includes(value)) invalid('unsupported setting or value');
       return `set ${scope} ${slot} ${field} ${value}`;
     }
@@ -668,13 +752,9 @@ export class SerialCommandWriter {
   }
 }
 
-/**
- * Browser Web Serial adapter.  It owns one reader and one writer, polls only
- * while connected, and never retries a user command after a write failure.
- */
-export class SerialClient {
-  constructor({ serial = globalThis.navigator?.serial, store = new DeviceStateStore(), clock = undefined } = {}) {
-    this.serial = serial;
+/** Shared line decoding, status normalization, state updates, and events. */
+class LineProtocolClient {
+  constructor({ store = new DeviceStateStore(), clock = undefined } = {}) {
     this.store = store;
     const suppliedClock = clock ?? {};
     this.clock = {
@@ -685,34 +765,77 @@ export class SerialClient {
       clearInterval: typeof suppliedClock.clearInterval === 'function'
         ? suppliedClock.clearInterval.bind(suppliedClock)
         : globalThis.clearInterval.bind(globalThis),
+      setTimeout: typeof suppliedClock.setTimeout === 'function'
+        ? suppliedClock.setTimeout.bind(suppliedClock)
+        : globalThis.setTimeout.bind(globalThis),
+      clearTimeout: typeof suppliedClock.clearTimeout === 'function'
+        ? suppliedClock.clearTimeout.bind(suppliedClock)
+        : globalThis.clearTimeout.bind(globalThis),
     };
-    this.port = null;
-    this.reader = null;
-    this.readTask = null;
-    this.writer = null;
-    this.pollTimer = null;
-    this.statusWatchdogTimer = null;
+    this.parser = new LineParser();
     this.lastStatusAt = null;
-    this.stopping = false;
     this.listeners = new Map();
   }
 
   on(event, listener) {
-    if (typeof listener !== 'function') invalid('serial listener must be a function');
+    if (typeof listener !== 'function') invalid('client listener must be a function');
     const listeners = this.listeners.get(event) ?? new Set();
     listeners.add(listener);
     this.listeners.set(event, listeners);
     return () => listeners.delete(listener);
   }
 
-  #emit(event, value) {
+  _emit(event, value) {
     for (const listener of this.listeners.get(event) ?? []) listener(value);
+  }
+
+  _consumeChunk(chunk) {
+    for (const event of this.parser.push(chunk)) this._consumeEvent(event);
+  }
+
+  _flushLines() {
+    for (const event of this.parser.flush()) this._consumeEvent(event);
+  }
+
+  _consumeEvent(event) {
+    this._emit('line', event);
+    if (event.kind !== 'json') return;
+    if (event.value?.protocol === 2) {
+      try {
+        this.store.applyStatus(event.value);
+        this.lastStatusAt = this.clock.now();
+        this._emit('status', this.store.snapshot().status);
+      } catch (error) {
+        this._emit('error', error);
+      }
+    } else if (Object.prototype.hasOwnProperty.call(event.value ?? {}, 'ok')) {
+      this._emit('response', event.value);
+    }
+  }
+}
+
+/**
+ * Browser Web Serial adapter. It owns one reader and one writer, polls only
+ * while connected, and never retries a user command after a write failure.
+ */
+export class SerialClient extends LineProtocolClient {
+  constructor({ serial = globalThis.navigator?.serial, store = new DeviceStateStore(), clock = undefined } = {}) {
+    super({ store, clock });
+    this.serial = serial;
+    this.port = null;
+    this.reader = null;
+    this.readTask = null;
+    this.writer = null;
+    this.pollTimer = null;
+    this.statusWatchdogTimer = null;
+    this.stopping = false;
   }
 
   async connect(port = undefined) {
     if (this.port) return this.store.snapshot();
     if (!this.serial?.requestPort && !port) throw new Error('このブラウザは Web Serial に対応していません');
     this.stopping = false;
+    this.parser = new LineParser();
     this.port = port ?? await this.serial.requestPort();
     try {
       await this.port.open({ baudRate: SERIAL_BAUD_RATE });
@@ -720,7 +843,7 @@ export class SerialClient {
       this.writer = new SerialCommandWriter(this.port.writable.getWriter());
       this.store.markConnected();
       this.lastStatusAt = this.clock.now();
-      this.#emit('connected', this.store.snapshot());
+      this._emit('connected', this.store.snapshot());
       this.readTask = this.#readLoop(this.port);
       this.pollTimer = this.clock.setInterval(() => this.#pollStatus(), 1000);
       this.statusWatchdogTimer = this.clock.setInterval(
@@ -760,7 +883,7 @@ export class SerialClient {
     this.readTask = null;
     await port.close().catch(() => undefined);
     this.store.markDisconnected();
-    this.#emit('disconnected', this.store.snapshot());
+    this._emit('disconnected', this.store.snapshot());
   }
 
   async #closeAfterFailure() {
@@ -814,7 +937,7 @@ export class SerialClient {
       // never leave a status on screen after a failed write.
       this.lastStatusAt = null;
       this.#invalidateStatus();
-      this.#emit('error', error);
+      this._emit('error', error);
     }
   }
 
@@ -831,7 +954,6 @@ export class SerialClient {
   }
 
   async #readLoop(port) {
-    const parser = new LineParser();
     let reader;
     try {
       reader = port.readable.getReader();
@@ -839,35 +961,304 @@ export class SerialClient {
       while (!this.stopping && this.port === port) {
         const { value, done } = await reader.read();
         if (done) break;
-        for (const event of parser.push(value)) this.#consume(event);
+        this._consumeChunk(value);
       }
-      for (const event of parser.flush()) this.#consume(event);
+      this._flushLines();
     } catch (error) {
-      if (!this.stopping) this.#emit('error', error);
+      if (!this.stopping) this._emit('error', error);
     } finally {
       if (reader) reader.releaseLock();
       this.reader = null;
       if (!this.stopping && this.port === port) {
-        this.#emit('error', new Error('シリアル接続が閉じられました'));
+        this._emit('error', new Error('シリアル接続が閉じられました'));
         await this.#handleUnexpectedDisconnect(port);
-        this.#emit('disconnected', this.store.snapshot());
+        this._emit('disconnected', this.store.snapshot());
       }
     }
   }
+}
 
-  #consume(event) {
-    this.#emit('line', event);
-    if (event.kind !== 'json') return;
-    if (event.value?.protocol === 2) {
+/**
+ * Web Bluetooth adapter for the Hub's newline-based GATT configuration
+ * service. It shares line parsing and state updates with SerialClient, and
+ * waits for each response before writing the next command.
+ */
+export class BluetoothClient extends LineProtocolClient {
+  constructor({
+    bluetooth = globalThis.navigator?.bluetooth,
+    store = new DeviceStateStore(),
+    clock = undefined,
+    pollIntervalMs = BLUETOOTH_STATUS_POLL_INTERVAL_MS,
+    staleAfterMs = BLUETOOTH_STATUS_STALE_AFTER_MS,
+    commandTimeoutMs = BLUETOOTH_COMMAND_TIMEOUT_MS,
+  } = {}) {
+    super({ store, clock });
+    this.bluetooth = bluetooth;
+    this.pollIntervalMs = pollIntervalMs;
+    this.staleAfterMs = staleAfterMs;
+    this.commandTimeoutMs = commandTimeoutMs;
+    this.device = null;
+    this.server = null;
+    this.rx = null;
+    this.tx = null;
+    this.writer = null;
+    this.notificationHandler = null;
+    this.disconnectHandler = null;
+    this.pendingResponse = null;
+    this.commandTail = Promise.resolve();
+    this.pollTimer = null;
+    this.statusWatchdogTimer = null;
+    this.stopping = false;
+
+    this.on('response', (response) => {
+      const pending = this.pendingResponse;
+      if (!pending) return;
+      this.pendingResponse = null;
+      this.clock.clearTimeout(pending.timer);
+      pending.resolve(response);
+    });
+  }
+
+  get supported() {
+    return typeof this.bluetooth?.requestDevice === 'function';
+  }
+
+  async connect() {
+    if (this.device?.gatt?.connected && this.rx && this.tx) return this.store.snapshot();
+    if (!this.supported) throw new Error('このブラウザでは Web Bluetooth を利用できません');
+    if (this.device) await this.disconnect();
+    this.stopping = false;
+    this.parser = new LineParser();
+
+    let permitted = [];
+    if (typeof this.bluetooth.getDevices === 'function') {
       try {
-        this.store.applyStatus(event.value);
-        this.lastStatusAt = this.clock.now();
-        this.#emit('status', this.store.snapshot().status);
-      } catch (error) {
-        this.#emit('error', error);
+        permitted = await this.bluetooth.getDevices();
+      } catch {
+        // A denied or unavailable saved-device list falls back to the chooser.
       }
-    } else if (Object.prototype.hasOwnProperty.call(event.value ?? {}, 'ok')) {
-      this.#emit('response', event.value);
     }
+    for (const device of permitted) {
+      if (!device.name?.startsWith(BLUETOOTH_NAME_PREFIX)) continue;
+      try {
+        await this.#open(device);
+        return this.store.snapshot();
+      } catch {
+        // A stale permission entry or failed reconnect falls back to a chooser.
+      }
+    }
+
+    const device = await this.bluetooth.requestDevice({
+      filters: [{ services: [BLE_CONFIG_SERVICE_UUID] }],
+    });
+    await this.#open(device);
+    return this.store.snapshot();
+  }
+
+  send(command) {
+    const run = this.commandTail.catch(() => undefined).then(async () => {
+      if (!this.#isConnected()) throw new Error('Bluetooth is not connected');
+      this.#clearPollTimer();
+      try {
+        const response = await this.#sendOne(command);
+        if (command !== 'status') await this.#sendOne('status');
+        this.#scheduleStatusPoll();
+        return response;
+      } catch (error) {
+        if (!this.stopping) this.#scheduleStatusPoll();
+        throw error;
+      }
+    });
+    this.commandTail = run.catch(() => undefined);
+    return run;
+  }
+
+  refreshStatus() {
+    return this.send('status');
+  }
+
+  async disconnect() {
+    if (!this.device) {
+      this.#clearTimers();
+      this.lastStatusAt = null;
+      this.store.markDisconnected();
+      return;
+    }
+    await this.#teardown(this.device, { closeGatt: true, emit: true });
+  }
+
+  async #open(device) {
+    this.device = device;
+    this.stopping = false;
+    this.disconnectHandler = () => {
+      void this.#teardown(device, { closeGatt: false, emit: true });
+    };
+    device.addEventListener('gattserverdisconnected', this.disconnectHandler);
+    let timeoutTimer;
+    const timeout = new Promise((resolve, reject) => {
+      timeoutTimer = this.clock.setTimeout(
+        () => reject(new Error(BLUETOOTH_CONNECT_TIMEOUT_MESSAGE)),
+        BLUETOOTH_CONNECT_TIMEOUT_MS,
+      );
+    });
+    try {
+      await Promise.race([this.#completeOpen(device), timeout]);
+    } catch (error) {
+      await this.#teardown(device, { closeGatt: true, emit: false });
+      throw error;
+    } finally {
+      this.clock.clearTimeout(timeoutTimer);
+    }
+  }
+
+  async #completeOpen(device) {
+    if (!device.gatt) throw new Error('Bluetooth device has no GATT server');
+    this.server = await device.gatt.connect();
+    this.#assertOpening(device);
+    const service = await this.server.getPrimaryService(BLE_CONFIG_SERVICE_UUID);
+    this.#assertOpening(device);
+    const rx = await service.getCharacteristic(BLE_CONFIG_RX_UUID);
+    this.#assertOpening(device);
+    const tx = await service.getCharacteristic(BLE_CONFIG_TX_UUID);
+    this.#assertOpening(device);
+    if (typeof rx.writeValueWithResponse !== 'function') {
+      throw new Error('Bluetooth RX does not support acknowledged writes');
+    }
+    if (typeof tx.startNotifications !== 'function' || typeof tx.addEventListener !== 'function') {
+      throw new Error('Bluetooth TX notifications are unavailable');
+    }
+    this.rx = rx;
+    this.tx = tx;
+    this.notificationHandler = (event) => {
+      const value = event.target?.value ?? event.value;
+      if (!value || !ArrayBuffer.isView(value)) return;
+      this._consumeChunk(new Uint8Array(value.buffer, value.byteOffset, value.byteLength));
+    };
+    tx.addEventListener('characteristicvaluechanged', this.notificationHandler);
+    await tx.startNotifications();
+    this.#assertOpening(device);
+    this.writer = new SerialCommandWriter({
+      write: (bytes) => rx.writeValueWithResponse(bytes),
+    });
+    this.store.markConnected();
+    this.lastStatusAt = this.clock.now();
+    this._emit('connected', this.store.snapshot());
+    this.statusWatchdogTimer = this.clock.setInterval(
+      () => this.#checkStatusFreshness(),
+      STATUS_WATCHDOG_INTERVAL_MS,
+    );
+    await this.send('status');
+  }
+
+  #assertOpening(device) {
+    if (this.device === device && !this.stopping) return;
+    if (device.gatt?.connected) device.gatt.disconnect();
+    throw new Error('Bluetooth connection closed');
+  }
+
+  #sendOne(command) {
+    if (!this.#isConnected() || !this.writer) {
+      return Promise.reject(new Error('Bluetooth is not connected'));
+    }
+    let resolveResponse;
+    let rejectResponse;
+    const responsePromise = new Promise((resolve, reject) => {
+      resolveResponse = resolve;
+      rejectResponse = reject;
+    });
+    const pending = {
+      resolve: resolveResponse,
+      reject: rejectResponse,
+      timer: null,
+    };
+    pending.timer = this.clock.setTimeout(() => {
+      if (this.pendingResponse !== pending) return;
+      this.pendingResponse = null;
+      const error = new Error('Bluetooth response timed out');
+      pending.reject(error);
+      this._emit('error', error);
+      void this.#teardown(this.device, { closeGatt: true, emit: true });
+    }, this.commandTimeoutMs);
+    this.pendingResponse = pending;
+
+    return (async () => {
+      try {
+        await this.writer.send(command);
+        return await responsePromise;
+      } catch (error) {
+        if (this.pendingResponse === pending) {
+          this.pendingResponse = null;
+          this.clock.clearTimeout(pending.timer);
+        }
+        throw error;
+      }
+    })();
+  }
+
+  #isConnected() {
+    return Boolean(!this.stopping && this.device?.gatt?.connected && this.writer);
+  }
+
+  #scheduleStatusPoll() {
+    this.#clearPollTimer();
+    if (!this.#isConnected()) return;
+    this.pollTimer = this.clock.setTimeout(() => {
+      this.pollTimer = null;
+      this.send('status').catch((error) => {
+        if (this.stopping) return;
+        this._emit('error', error);
+        this.#scheduleStatusPoll();
+      });
+    }, this.pollIntervalMs);
+  }
+
+  #clearPollTimer() {
+    if (this.pollTimer === null) return;
+    this.clock.clearTimeout(this.pollTimer);
+    this.pollTimer = null;
+  }
+
+  #clearTimers() {
+    this.#clearPollTimer();
+    if (this.statusWatchdogTimer !== null) {
+      this.clock.clearInterval(this.statusWatchdogTimer);
+      this.statusWatchdogTimer = null;
+    }
+  }
+
+  #checkStatusFreshness() {
+    if (!this.#isConnected() || this.lastStatusAt === null) return;
+    if (this.clock.now() - this.lastStatusAt < this.staleAfterMs) return;
+    this.lastStatusAt = null;
+    this.store.clearStatus();
+  }
+
+  async #teardown(device, { closeGatt, emit }) {
+    if (device !== this.device) return;
+    this.stopping = true;
+    this.#clearTimers();
+    this.lastStatusAt = null;
+    if (this.pendingResponse) {
+      const pending = this.pendingResponse;
+      this.pendingResponse = null;
+      this.clock.clearTimeout(pending.timer);
+      pending.reject(new Error('Bluetooth connection closed'));
+    }
+    if (this.tx && this.notificationHandler) {
+      this.tx.removeEventListener?.('characteristicvaluechanged', this.notificationHandler);
+    }
+    device.removeEventListener?.('gattserverdisconnected', this.disconnectHandler);
+    const writer = this.writer;
+    this.writer = null;
+    this.notificationHandler = null;
+    this.disconnectHandler = null;
+    this.server = null;
+    this.rx = null;
+    this.tx = null;
+    this.device = null;
+    if (writer) await writer.close().catch(() => undefined);
+    if (closeGatt && device.gatt?.connected) device.gatt.disconnect();
+    this.store.markDisconnected();
+    if (emit) this._emit('disconnected', this.store.snapshot());
   }
 }

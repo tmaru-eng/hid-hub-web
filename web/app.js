@@ -10,37 +10,39 @@ import {
   HOST_OS,
   BUTTON_ORDER_PRESETS,
   buttonOrderChoices,
+  PC_COUNT,
+  SWITCH_KEYS,
+  switchKeysProblem,
   buttonOrderLabel,
+  configurationFieldPolicy,
   rgbAt,
+  BluetoothClient,
   SerialClient,
   buildCommand,
 } from './protocol.js';
 
 const INPUT_LABELS = Object.freeze({ k1: 'キーボード1', k2: 'キーボード2', m1: 'マウス1', m2: 'マウス2' });
 const INPUT_TYPES = Object.freeze({ k1: 'kbd', k2: 'kbd', m1: 'mouse', m2: 'mouse' });
-const PATTERNS = Object.freeze({
-  pc1: { name: 'PC1', detail: '赤・選択中のPC', ledState: { state: 'normal', selectedPc: 1, registered: true, connected: true } },
-  pc2: { name: 'PC2', detail: '緑・選択中のPC', ledState: { state: 'normal', selectedPc: 2, registered: true, connected: true } },
-  pc3: { name: 'PC3', detail: '青・選択中のPC', ledState: { state: 'normal', selectedPc: 3, registered: true, connected: true } },
-  'select-slot': { name: '入力枠を選択中', detail: '水色でゆっくり明暗', ledState: { state: 'select-slot' } },
-  'input-k1': { name: 'キーボード1 登録中', detail: '黄・1回短点滅＋長点灯', ledState: { state: 'pairing', target: 'k1' } },
-  'input-k2': { name: 'キーボード2 登録中', detail: '黄・2回短点滅＋長点灯', ledState: { state: 'pairing', target: 'k2' } },
-  'input-m1': { name: 'マウス1 登録中', detail: '水色・3回短点滅＋長点灯', ledState: { state: 'pairing', target: 'm1' } },
-  'input-m2': { name: 'マウス2 登録中', detail: '水色・4回短点滅＋長点灯', ledState: { state: 'pairing', target: 'm2' } },
-  pairing: { name: '登録中', detail: '対象の短点滅群に続く長点灯', ledState: { state: 'pairing', target: 'k1' } },
-  confirm: { name: '入れ替え確認', detail: '対象の表示に続く紫の長点灯', ledState: { state: 'confirm', target: 'pc2' } },
-  success: { name: '登録成功', detail: '白を600ms点灯して通常表示へ', ledState: { state: 'success', previous: { state: 'normal', selectedPc: 1, registered: true, connected: true } } },
-  failure: { name: '失敗・時間切れ', detail: '白を100msずつ3回点滅', ledState: { state: 'failure', previous: { state: 'normal', selectedPc: 1, registered: true, connected: true } } },
-  cancel: { name: '確認時間切れ', detail: '200ms消灯して通常表示へ', ledState: { state: 'cancel', previous: { state: 'normal', selectedPc: 1, registered: true, connected: true } } },
-  idle: { name: '本体未接続', detail: '本体の状態を取得できません', ledState: null },
+const LED_PREVIEWS = Object.freeze({
+  pc1: { name: 'PC1', detail: '赤・選択中のPC' },
+  pc2: { name: 'PC2', detail: '緑・選択中のPC' },
+  pc3: { name: 'PC3', detail: '青・選択中のPC' },
+  'select-slot': { name: '入力枠を選択中', detail: '水色で呼吸' },
+  pairing: { name: '登録中', detail: 'キーボードは黄、マウスは紫。1番は1回・2番は2回の短点滅に続く長点灯' },
+  confirm: { name: '入れ替え確認', detail: '対象の表示に続いて白く長点灯' },
+  success: { name: '登録成功', detail: '白を600ms点灯して通常表示へ' },
+  failure: { name: '失敗・時間切れ', detail: '白を100msずつ3回点滅' },
+  cancel: { name: '確認時間切れ', detail: '200ms消灯して通常表示へ' },
+  idle: { name: '本体未接続', detail: '本体の状態を取得できません' },
 });
 
 const $ = (id) => document.getElementById(id);
 const store = new DeviceStateStore();
-const client = new SerialClient({ store });
+const bluetoothClient = new BluetoothClient({ store });
+const usbClient = new SerialClient({ store });
 let mode = 'disconnected';
-let demoStatus = null;
-let demoPattern = 'pc1';
+let transport = null;
+let activeClient = null;
 let pendingDestructive = null;
 let busy = false;
 let lastResponse = null;
@@ -48,29 +50,7 @@ let activeLedPatternKey = null;
 let activeLedState = null;
 let ledEpoch = 0;
 
-function makeDemoStatus() {
-  return {
-    protocol: 2,
-    selectedPc: 1,
-    pcs: [
-      { registered: true, connected: true, name: null },
-      { registered: true, connected: false, name: null },
-      { registered: false, connected: false, name: null },
-    ],
-    inputs: [
-      { id: 'k1', slot: 1, registered: true, connected: true, name: null },
-      { id: 'k2', slot: null, registered: false, connected: false, name: null },
-      { id: 'm1', slot: 2, registered: true, connected: false, name: null },
-      { id: 'm2', slot: null, registered: false, connected: false, name: null },
-    ],
-    legacyInputs: [{ slot: 4, registered: true, connected: false }],
-    config: { inputLayouts: ['us', 'us', 'us', 'jis'], outputLayouts: ['us', 'jis', 'us'], outputOs: ['macos', 'windows', 'unspecified'], buttonOrder: '123M' },
-    ui: { state: 'normal', target: null, operation: null, remainingMs: 0, result: '', resultRemainingMs: 0, confirmationId: 0 },
-  };
-}
-
 function currentStatus() {
-  if (mode === 'demo') return demoStatus;
   return store.snapshot().status;
 }
 
@@ -80,6 +60,25 @@ function isLive() {
 
 function canSend() {
   return isLive() && !busy;
+}
+
+function canChangeRegistration() {
+  return canSend() && transport !== 'bluetooth';
+}
+
+function bluetoothUnavailableMessage() {
+  if (!window.isSecureContext) return 'Bluetooth接続には HTTPS または localhost が必要です。';
+  if (!bluetoothClient.supported) return 'このブラウザは Web Bluetooth に対応していません。';
+  return '';
+}
+
+function formatConnectionInterval(intervalUs) {
+  if (!Number.isSafeInteger(intervalUs) || intervalUs < 0) return null;
+  const milliseconds = intervalUs / 1000;
+  const value = Number.isInteger(milliseconds)
+    ? String(milliseconds)
+    : milliseconds.toFixed(2).replace(/0+$/, '').replace(/\.$/, '');
+  return `通信間隔 ${value} ms`;
 }
 
 function formatTarget(target) {
@@ -96,7 +95,7 @@ function formatDuration(ms) {
 
 function deviceName(entry, fallback) {
   if (entry?.name !== null && typeof entry?.name === 'string' && entry.name.trim() !== '') return entry.name;
-  return entry?.registered ? '機器名未取得' : fallback;
+  return entry?.registered ? '名前未取得' : fallback;
 }
 
 function makeButton(label, className, { disabled = false, hidden = false, title = '', ariaLabel = '', onClick } = {}) {
@@ -153,32 +152,50 @@ function renderConnection() {
   const pill = $('connectionPill');
   const label = $('connectionLabel');
   const connected = mode === 'live';
-  const demo = mode === 'demo';
-  pill.dataset.state = connected ? 'connected' : demo ? 'demo' : 'disconnected';
-  label.textContent = connected ? 'USBシリアル接続中' : demo ? 'デモモード' : '設定画面未接続';
-  $('connectButton').disabled = connected || busy;
-  $('connectButton').textContent = demo ? 'デモを閉じる' : 'UART USBに接続';
+  const bluetoothUnavailable = bluetoothUnavailableMessage();
+  const usbSupported = typeof navigator.serial?.requestPort === 'function';
+  pill.dataset.state = connected ? 'connected' : 'disconnected';
+  label.textContent = connected
+    ? transport === 'bluetooth' ? 'Bluetooth接続中' : 'USBシリアル接続中'
+    : '設定画面未接続';
+  $('connectButton').disabled = connected || busy || Boolean(bluetoothUnavailable);
+  $('connectButton').textContent = 'Bluetooth で接続';
+  $('connectButton').title = bluetoothUnavailable;
+  $('bluetoothSupport').hidden = !bluetoothUnavailable;
+  $('bluetoothSupport').textContent = bluetoothUnavailable
+    ? `${bluetoothUnavailable} ${usbSupported ? 'USBで接続する場合は下のボタンを使ってください。' : 'このブラウザではUSB Web Serialも利用できません。'}`
+    : '';
+  $('usbConnectButton').disabled = connected || busy || !usbSupported;
+  $('usbConnectButton').title = usbSupported ? '' : 'このブラウザは Web Serial に対応していません。';
   $('disconnectButton').disabled = !connected || busy;
-  $('demoButton').disabled = connected || busy;
-  $('demoButton').textContent = demo ? 'デモを閉じる' : 'デモを開く';
+  $('footerTransport').textContent = connected
+    ? `設定画面 · ${transport === 'bluetooth' ? 'Bluetooth' : 'USB'}`
+    : 'Bluetooth接続を優先 · USB接続も利用可能';
 }
 
 function renderNotice() {
   const notice = $('modeNotice');
   const title = $('modeTitle');
   const description = $('modeDescription');
-  notice.dataset.mode = mode === 'live' ? 'live' : mode === 'demo' ? 'demo' : 'disconnected';
+  notice.dataset.mode = mode;
   if (mode === 'live') {
     title.textContent = currentStatus() ? '本体に接続しています' : '本体に接続済み・状態を待っています';
-    description.textContent = currentStatus()
-      ? '表示中の登録・接続・操作状態は、本体から受け取った最新の情報です。'
-      : '本体の状態が届くまで操作を無効にしています。';
-  } else if (mode === 'demo') {
-    title.textContent = 'デモモード — 本体へは送信しません';
-    description.textContent = 'カードの操作ボタンは無効です。下のLEDパターンだけを、実機なしで確認できます。';
+    if (transport === 'bluetooth') {
+      description.textContent = currentStatus()
+        ? 'Bluetooth接続中は登録・入れ替え・登録解除・全消去を使えません。USB で接続するか、本体のボタンで操作してください。PC切り替えと設定は使えます。'
+        : 'Bluetooth接続を確立しました。状態が届くまで操作を無効にしています。';
+    } else {
+      description.textContent = currentStatus()
+        ? '表示中の登録・接続・操作状態は、本体から受け取った最新の情報です。'
+        : 'UART USBで本体に接続済みです。状態が届くまで操作を無効にしています。';
+    }
   } else {
     title.textContent = '設定画面と本体が未接続';
-    description.textContent = '基板写真の向きで右側にある UART USB ポートをPCへ接続し、「UART USBに接続」を押してください。';
+    const bluetoothUnavailable = bluetoothUnavailableMessage();
+    const usbSupported = typeof navigator.serial?.requestPort === 'function';
+    description.textContent = bluetoothUnavailable
+      ? `${bluetoothUnavailable} ${usbSupported ? 'Bluetoothに対応したブラウザで開くか、USBで接続してください。' : 'Bluetoothに対応したブラウザでHTTPSまたはlocalhostから開いてください。'}`
+      : '「Bluetooth で接続」を押して本体を選んでください。USBで接続する場合は「USBで接続」を使ってください。';
   }
 }
 
@@ -197,7 +214,7 @@ function renderOperation() {
   if (!status) {
     badge.textContent = '状態不明';
     title.textContent = '本体の状態を取得できません';
-    detail.textContent = mode === 'demo' ? 'デモの状態がありません。デモを開き直してください。' : '本体の状態が届くまで、画面側では状態を推測しません。';
+    detail.textContent = '本体の状態が届くまで、画面側では状態を推測しません。';
     if (lastResponse) {
       result.hidden = false;
       result.dataset.kind = lastResponse.ok ? 'ok' : 'error';
@@ -208,27 +225,24 @@ function renderOperation() {
   const ui = status.ui;
   badge.textContent = describeUiState(ui.state);
   badge.dataset.state = ui.state;
-  if (mode === 'demo') {
-    title.textContent = 'デモの状態';
-    detail.textContent = 'これは実機の状態ではありません。';
-  } else if (ui.state === 'normal') {
+  if (ui.state === 'normal') {
     title.textContent = `通常表示 · 選択中 ${formatTarget(`pc${status.selectedPc}`)}`;
     detail.textContent = 'PCの短押しは出力先を選択し、入力はそのPCへまとめて送られます。';
   } else if (ui.state === 'select-slot') {
     title.textContent = '入力枠を選択中';
     detail.textContent = 'MODEを離し、PC1・PC2・PC3・MODEのボタンでK1・K2・M1・M2を選んでください。登録済みの枠は確認なしで入れ替えます。';
     if (ui.remainingMs > 0) remaining.textContent = formatDuration(ui.remainingMs);
-    cancel.hidden = mode === 'demo';
+    cancel.hidden = false;
   } else if (ui.state === 'confirm') {
     title.textContent = `${describeUiState(ui.state)} · ${formatTarget(ui.target)}`;
-    detail.textContent = '確認して続けると古い登録を削除し、新しい登録待ちになります。失敗・中止の場合は未登録のままです。PC側で再ペアリングが必要になる場合があります。';
+    detail.textContent = '別機器への入れ替えは新しい登録の保存後に反映します。中止・失敗・時間切れ・bond保存満杯では前の登録が残ります。同じ機器の鍵交換後は新しい鍵を使います。';
     if (ui.remainingMs > 0) remaining.textContent = formatDuration(ui.remainingMs);
-    cancel.hidden = mode === 'demo';
+    cancel.hidden = false;
   } else {
     title.textContent = `${describeUiState(ui.state)} · ${formatTarget(ui.target)}`;
     detail.textContent = `${ui.operation ? `操作: ${describeOperation(ui.operation)}` : '本体が処理中です'}。完了・失敗は本体からの結果を待ちます。`;
     if (ui.remainingMs > 0) remaining.textContent = formatDuration(ui.remainingMs);
-    cancel.hidden = mode === 'demo';
+    cancel.hidden = false;
   }
   if (ui.result) {
     result.hidden = false;
@@ -287,33 +301,34 @@ function renderPcCards() {
     rows.className = 'status-row';
     addStatusChip(rows, entry.registered ? '登録済み' : '未登録', entry.registered ? 'registered' : 'unknown');
     addStatusChip(rows, entry.connected ? 'BLE接続中' : entry.registered ? 'BLE未接続' : 'BLE状態—', entry.connected ? 'connected' : 'unknown');
+    if (entry.connected) addStatusChip(rows, formatConnectionInterval(entry.intervalUs) ?? '通信間隔 —');
     card.append(rows);
     const actions = document.createElement('div');
     actions.className = 'card-actions';
     const disabled = !canSend();
+    const registrationDisabled = !canChangeRegistration();
     actions.append(makeButton(selected ? '選択中' : '出力先に選択', 'button-soft', {
       disabled: disabled || selected,
-      title: mode === 'demo' ? 'デモ中はコマンドを送信しません' : '',
       ariaLabel: `PC${pcNumber}${selected ? 'は選択中' : 'を出力先に選択'}`,
       onClick: () => sendCommand(buildCommand('select', pcNumber), `PC${pcNumber}を選択`),
     }));
     if (entry.registered) {
       actions.append(makeButton('入れ替え', 'button-ghost', {
-        disabled,
-        title: '確認して続けると古い登録を削除します。失敗・中止の場合は未登録のままです。',
+        disabled: registrationDisabled,
+        title: '別PCへの入れ替えは新しい登録の保存後に反映します。中止・失敗・時間切れ・bond保存満杯では現在の登録が残ります。同じPCの鍵交換後は新しい鍵を使います。',
         ariaLabel: `PC${pcNumber}を入れ替え`,
-        onClick: () => sendCommand(buildCommand('replace', 'pc', pcNumber), `PC${pcNumber}の入れ替え確認`),
+        onClick: () => sendCommand(buildCommand('replace', 'pc', pcNumber), `PC${pcNumber}の入れ替え確認`, { requiresUsb: true }),
       }));
       actions.append(makeButton('登録解除', 'button-danger-outline', {
-        disabled,
+        disabled: registrationDisabled,
         ariaLabel: `PC${pcNumber}の登録を解除`,
         onClick: () => openDestructive(`PC${pcNumber}の登録を解除しますか？`, '現在のPC登録だけを解除します。入力枠や他のPCは変更しません。', buildCommand('forget', 'pc', pcNumber)),
       }));
     } else {
       actions.append(makeButton('登録する', 'button-ghost', {
-        disabled,
+        disabled: registrationDisabled,
         ariaLabel: `PC${pcNumber}を登録`,
-        onClick: () => sendCommand(buildCommand('pair', 'pc', pcNumber), `PC${pcNumber}の登録`),
+        onClick: () => sendCommand(buildCommand('pair', 'pc', pcNumber), `PC${pcNumber}の登録`, { requiresUsb: true }),
       }));
     }
     card.append(actions);
@@ -359,34 +374,37 @@ function renderInputCards() {
     rows.className = 'status-row';
     addStatusChip(rows, entry.registered ? '登録済み' : '未登録', entry.registered ? 'registered' : 'unknown');
     addStatusChip(rows, entry.connected ? 'BLE接続中' : entry.registered ? 'BLE未接続' : 'BLE状態—', entry.connected ? 'connected' : 'unknown');
+    if (entry.connected) addStatusChip(rows, formatConnectionInterval(entry.intervalUs) ?? '通信間隔 —');
     addStatusChip(rows, entry.slot === null ? '物理枠 未割当' : `物理枠 ${entry.slot}`, entry.slot === null ? 'unknown' : 'connected');
+    if (entry.intervalPolicyGaveUp) addStatusChip(rows, '30 ms 要求を終了', 'unknown');
+    if ((entry.peerIntervalRejections ?? 0) > 0) addStatusChip(rows, `短い間隔要求を拒否 ${entry.peerIntervalRejections} 回`, 'unknown');
     card.append(rows);
     const actions = document.createElement('div');
     actions.className = 'card-actions';
-    const disabled = !canSend();
+    const registrationDisabled = !canChangeRegistration();
     if (entry.registered) {
       actions.append(makeButton('入れ替え', 'button-ghost', {
-        disabled,
-        title: '確認して続けると古い登録を削除します。失敗・中止の場合は未登録のままです。',
+        disabled: registrationDisabled,
+        title: '別機器への入れ替えは新しい登録の保存後に反映します。中止・失敗・時間切れ・bond保存満杯では現在の登録が残ります。同じ機器の鍵交換後は新しい鍵を使います。',
         ariaLabel: `${label}を入れ替え`,
-        onClick: () => sendCommand(buildCommand('replace', 'input', key), `${label}の入れ替え確認`),
+        onClick: () => sendCommand(buildCommand('replace', 'input', key), `${label}の入れ替え確認`, { requiresUsb: true }),
       }));
       actions.append(makeButton('登録解除', 'button-danger-outline', {
-        disabled,
+        disabled: registrationDisabled,
         ariaLabel: `${label}の登録を解除`,
         onClick: () => openDestructive(`${label}の登録を解除しますか？`, 'この入力枠だけを解除します。他の入力枠やPC登録は変更しません。', buildCommand('forget', 'input', key)),
       }));
     } else {
       actions.append(makeButton('登録する', 'button-ghost', {
-        disabled,
+        disabled: registrationDisabled,
         ariaLabel: `${label}を登録`,
-        onClick: () => sendCommand(buildCommand('pair', 'input', key), `${label}の登録`),
+        onClick: () => sendCommand(buildCommand('pair', 'input', key), `${label}の登録`, { requiresUsb: true }),
       }));
     }
     card.append(actions);
     const footnote = document.createElement('p');
     footnote.className = 'card-footnote';
-    footnote.textContent = entry.name === null && entry.registered ? '機器名を取得できませんでした。' : '入力枠はPCの出力先選択とは独立しています。';
+    footnote.textContent = entry.name === null && entry.registered ? '名前未取得' : '入力枠はPCの出力先選択とは独立しています。';
     card.append(footnote);
     root.append(card);
   }
@@ -415,7 +433,7 @@ function makeConfigField(parent, scope, slot, field, label, choices) {
   }
   const current = document.createElement('span');
   current.className = 'config-current';
-  const control = { scope, slot, field, select, current, saved: null, dirty: false, button: null };
+  const control = { scope, slot, field, select, checkbox: null, current, saved: null, dirty: false, button: null };
   const button = makeButton('保存', 'button-soft', {
     ariaLabel: `${controlLabel}を保存`,
     onClick: () => sendCommand(scope === 'buttons' ? buildCommand('set-buttons', select.value) : buildCommand('set', scope, slot, field, select.value), `${label}を保存`),
@@ -427,7 +445,116 @@ function makeConfigField(parent, scope, slot, field, label, choices) {
   parent.append(row);
 }
 
+function makeConfigToggle(parent, slot, label) {
+  const field = 'mac-delete-swap';
+  const row = document.createElement('div');
+  row.className = 'config-field config-toggle-field';
+  const caption = document.createElement('label');
+  const checkbox = document.createElement('input');
+  checkbox.id = `config-input-${slot}-${field}`;
+  checkbox.type = 'checkbox';
+  checkbox.setAttribute('aria-label', `物理枠${slot}の${label}`);
+  caption.htmlFor = checkbox.id;
+  caption.append(checkbox, document.createTextNode(label));
+  const current = document.createElement('span');
+  current.className = 'config-current';
+  const control = { scope: 'input', slot, field, select: null, checkbox, current, saved: null, dirty: false, button: null };
+  const button = makeButton('保存', 'button-soft', {
+    ariaLabel: `物理枠${slot}のMac DeleteとBack Space設定を保存`,
+    onClick: () => sendCommand(
+      buildCommand('set', 'input', slot, field, checkbox.checked ? 'on' : 'off'),
+      `物理枠${slot}のDeleteとBack Space設定を保存`,
+    ),
+  });
+  control.button = button;
+  checkbox.addEventListener('change', () => { control.dirty = checkbox.checked !== control.saved; renderConfiguration(); });
+  configControls.set(`input-${slot}-${field}`, control);
+  row.append(caption, button, current);
+  parent.append(row);
+}
+
+const shortcutKeySelects = [];
+let shortcutKeyDirty = false;
+const shortcutKeyUi = {};
+
+function initShortcutKeys() {
+  const panel = document.createElement('article');
+  panel.className = 'panel config-card';
+  const note = document.createElement('p');
+  note.className = 'config-note';
+  note.textContent = 'Ctrl + Alt + Shift を押しながらキーを押すとPCが切り替わります。初期設定は 1・2・3 で、ここでPCごとに好きなキー（例: A・S・D）へ変えられます。';
+  panel.append(note);
+  for (let slot = 1; slot <= PC_COUNT; slot += 1) {
+    const row = document.createElement('div');
+    row.className = 'config-field';
+    const caption = document.createElement('label');
+    caption.htmlFor = `config-shortcut-key-${slot}`;
+    caption.textContent = `PC${slot}へ切り替えるキー`;
+    const select = document.createElement('select');
+    select.id = caption.htmlFor;
+    select.setAttribute('aria-label', `PC${slot}へ切り替えるキー`);
+    for (const key of SWITCH_KEYS) {
+      const option = document.createElement('option');
+      option.value = key;
+      option.textContent = key.toUpperCase();
+      select.append(option);
+    }
+    select.addEventListener('change', () => { shortcutKeyDirty = true; renderShortcutKeys(); });
+    shortcutKeySelects.push(select);
+    row.append(caption, select);
+    panel.append(row);
+  }
+  const problem = document.createElement('p');
+  problem.className = 'config-current';
+  const current = document.createElement('p');
+  current.className = 'config-current';
+  const button = makeButton('保存', 'button-soft', {
+    ariaLabel: 'PC切り替えキーを保存',
+    onClick: () => sendCommand(
+      buildCommand('set-shortcut-keys', shortcutKeySelects.map((select) => select.value)),
+      'PC切り替えキーを保存',
+    ),
+  });
+  const reset = makeButton('初期設定（1・2・3）に戻す', 'button-soft', {
+    ariaLabel: 'PC切り替えキーを初期設定の1・2・3に戻す',
+    onClick: () => sendCommand(buildCommand('set-shortcut-default'), 'PC切り替えキーを初期設定に戻す'),
+  });
+  Object.assign(shortcutKeyUi, { problem, current, button, reset });
+  panel.append(problem, button, reset, current);
+  $('shortcutConfig').append(panel);
+}
+
+function renderShortcutKeys() {
+  const status = currentStatus();
+  const config = status?.config;
+  const supported = Boolean(config && config.shortcutKeys !== undefined);
+  const saved = supported && config.shortcutKeys.length === PC_COUNT ? config.shortcutKeys : null;
+  if (!shortcutKeyDirty) {
+    // Show the saved keys, or the default A/S/D proposal when the hub uses another chord.
+    (saved ?? ['a', 's', 'd']).forEach((key, index) => { shortcutKeySelects[index].value = key; });
+  }
+  const keys = shortcutKeySelects.map((select) => select.value);
+  const problem = switchKeysProblem(keys);
+  const same = saved && saved.every((key, index) => key === keys[index]);
+  if (same) shortcutKeyDirty = false;
+  shortcutKeyUi.problem.textContent = problem ?? '';
+  shortcutKeyUi.current.textContent = !supported
+    ? 'このファームはPC切り替えキーの設定に未対応です。ファームウェアを更新してください。'
+    : saved
+      ? `本体の保存値: ${saved.map((key, index) => `PC${index + 1}=${key.toUpperCase()}`).join(' ')}${same ? '' : ' · 未保存の変更あり'}`
+      : config.shortcut === 'ctrl-alt-shift-digits'
+        ? '本体の保存値: 初期設定（Ctrl+Alt+Shift+1・2・3）'
+        : config.shortcut === 'off'
+          ? '本体の保存値: キーボードでの切り替えなし'
+          : `本体の保存値: ${config.shortcut}`;
+  const disabled = !canSend() || !supported || status.ui.state !== 'normal';
+  shortcutKeySelects.forEach((select) => { select.disabled = disabled; });
+  shortcutKeyUi.button.disabled = disabled || Boolean(problem) || Boolean(same);
+  shortcutKeyUi.reset.disabled = disabled || (supported && config.shortcut === 'ctrl-alt-shift-digits');
+}
+
 function initConfiguration() {
+  initShortcutKeys();
   const buttonPanel = document.createElement('article');
   buttonPanel.className = 'panel config-card';
   makeConfigField(buttonPanel, 'buttons', 0, 'order', 'ボタンの並び', BUTTON_ORDER_PRESETS);
@@ -449,22 +576,31 @@ function initConfiguration() {
     configInputTitles.set(slot, title);
     panel.append(title);
     makeConfigField(panel, 'input', slot, 'layout', '入力配列', LAYOUTS);
+    makeConfigToggle(panel, slot, 'Mac へ送るとき Delete と Back Space を入れ替える（HHKB の HHK モード向け。Fn+` も Back Space になります）');
     $('inputConfig').append(panel);
   }
 }
 
 function renderConfiguration() {
+  renderShortcutKeys();
   const status = currentStatus();
   const config = status?.config;
-  $('configAvailability').textContent = !status ? '設定を取得できません。' : !config ? 'このファームは設定の読み出しに未対応です。' : mode === 'demo' ? 'デモの設定例です。保存できません。' : '保存後、本体から届く設定値を確認します。';
+  $('configAvailability').textContent = !status ? '設定を取得できません。' : !config ? 'このファームは設定の読み出しに未対応です。' : '保存後、本体から届く設定値を確認します。';
   for (const [slot, title] of configInputTitles) {
     const role = status?.inputs.find((entry) => entry.slot === slot);
     const legacy = status?.legacyInputs.some((entry) => entry.slot === slot);
     title.textContent = `物理枠${slot} · ${role ? INPUT_LABELS[role.id] : legacy ? '割当待ち' : '未割当'}`;
   }
   for (const control of configControls.values()) {
-    const values = control.scope === 'input' ? config?.inputLayouts : control.field === 'os' ? config?.outputOs : config?.outputLayouts;
-    const saved = control.scope === 'buttons' ? config?.buttonOrder ?? null : values?.[control.slot - 1] ?? null;
+    const macDeleteSwapUnsupported = Boolean(
+      control.checkbox && config && !config.inputMacDeleteSwapSupported,
+    );
+    const values = control.checkbox
+      ? (macDeleteSwapUnsupported ? undefined : config?.inputMacDeleteSwap)
+      : control.scope === 'input' ? config?.inputLayouts : control.field === 'os' ? config?.outputOs : config?.outputLayouts;
+    const saved = macDeleteSwapUnsupported
+      ? null
+      : control.scope === 'buttons' ? config?.buttonOrder ?? null : values?.[control.slot - 1] ?? null;
     if (control.scope === 'buttons') {
       const custom = control.select.querySelector('[data-custom-order]');
       const customValue = buttonOrderChoices(saved)[2] ?? null;
@@ -477,18 +613,27 @@ function renderConfiguration() {
         control.select.append(option);
       }
     }
+    const currentValue = control.checkbox ? control.checkbox.checked : control.select.value;
     if (saved === null) {
       control.dirty = false;
-      control.select.selectedIndex = -1;
-    } else if (!control.dirty || control.select.value === saved) {
-      control.select.value = saved;
+      if (control.checkbox) control.checkbox.checked = false;
+      else control.select.selectedIndex = -1;
+    } else if (!control.dirty || currentValue === saved) {
+      if (control.checkbox) control.checkbox.checked = saved;
+      else control.select.value = saved;
       control.dirty = false;
     }
     control.saved = saved;
-    const savedLabel = control.scope === 'buttons' ? buttonOrderLabel(saved) : CONFIG_LABELS[saved];
-    control.current.textContent = saved === null ? '保存値は不明' : `本体の保存値: ${savedLabel}${control.dirty ? ' · 未保存の変更あり' : ''}`;
-    const disabled = !canSend() || !config || status.ui.state !== 'normal' || (control.scope === 'buttons' && saved === null);
-    control.select.disabled = disabled;
+    const savedLabel = control.checkbox ? (saved ? 'オン' : 'オフ') : control.scope === 'buttons' ? buttonOrderLabel(saved) : CONFIG_LABELS[saved];
+    const policy = configurationFieldPolicy(control.scope, transport);
+    const guidance = macDeleteSwapUnsupported
+      ? 'このファームはこの設定に未対応です。ファームウェアを更新してください。'
+      : policy.guidance;
+    const savedText = saved === null ? '保存値は不明' : `本体の保存値: ${savedLabel}${control.dirty ? ' · 未保存の変更あり' : ''}`;
+    control.current.textContent = guidance ? `${savedText} · ${guidance}` : savedText;
+    const disabled = !canSend() || !config || status.ui.state !== 'normal' || policy.disabled || macDeleteSwapUnsupported || (control.scope === 'buttons' && saved === null);
+    if (control.checkbox) control.checkbox.disabled = disabled;
+    else control.select.disabled = disabled;
     control.button.disabled = disabled || !control.dirty;
   }
 }
@@ -525,7 +670,7 @@ function renderCandidates() {
     card.append(top);
     const name = document.createElement('p');
     name.className = `candidate-name${candidate.name === null ? ' unknown' : ''}`;
-    name.textContent = candidate.name === null ? '機器名未取得' : candidate.name;
+    name.textContent = candidate.name === null ? '名前未取得' : candidate.name;
     card.append(name);
     const address = document.createElement('code');
     address.className = 'candidate-address';
@@ -536,12 +681,12 @@ function renderCandidates() {
     note.textContent = '種類は接続して確認';
     card.append(note);
     card.append(makeButton('この候補を選択', 'button-soft', {
-      disabled: !canSend(),
+      disabled: !canChangeRegistration(),
       ariaLabel: `候補${candidate.id}を選択`,
-      title: mode === 'demo' ? 'デモ中はコマンドを送信しません' : '',
       onClick: () => sendCommand(
         buildCommand('choose', 'input', status.candidateGeneration, candidate.id),
         `候補${candidate.id}を選択`,
+        { requiresUsb: true },
       ),
     }));
     root.append(card);
@@ -565,11 +710,14 @@ function renderLegacyCards() {
     rows.className = 'status-row';
     addStatusChip(rows, entry.registered ? '登録済み' : '未登録', entry.registered ? 'registered' : 'unknown');
     addStatusChip(rows, entry.connected ? 'BLE接続中' : entry.registered ? 'BLE未接続' : 'BLE状態—', entry.connected ? 'connected' : 'unknown');
+    if (entry.intervalPolicyGaveUp) addStatusChip(rows, '30 ms 要求を終了', 'unknown');
+    if ((entry.peerIntervalRejections ?? 0) > 0) addStatusChip(rows, `短い間隔要求を拒否 ${entry.peerIntervalRejections} 回`, 'unknown');
     card.append(rows);
     const actions = document.createElement('div');
     actions.className = 'legacy-actions';
     const select = document.createElement('select');
     select.setAttribute('aria-label', `物理スロット${entry.slot}の割り当て先`);
+    select.disabled = !canChangeRegistration();
     for (const key of INPUT_KEYS) {
       const option = document.createElement('option');
       option.value = key;
@@ -577,9 +725,8 @@ function renderLegacyCards() {
       select.append(option);
     }
     const assign = makeButton('この枠へ割り当て', 'button-soft', {
-      disabled: !canSend(),
-      title: mode === 'demo' ? 'デモ中はコマンドを送信しません' : '',
-      onClick: () => sendCommand(buildCommand('assign', 'input', entry.slot, select.value), `物理スロット${entry.slot}の割り当て`),
+      disabled: !canChangeRegistration(),
+      onClick: () => sendCommand(buildCommand('assign', 'input', entry.slot, select.value), `物理スロット${entry.slot}の割り当て`, { requiresUsb: true }),
     });
     actions.append(select, assign);
     card.append(actions);
@@ -587,9 +734,8 @@ function renderLegacyCards() {
   }
 }
 
-function setLed(patternKey, stateOverride = undefined, elapsedMs = 0) {
-  const pattern = PATTERNS[patternKey] ?? PATTERNS.idle;
-  const nextState = stateOverride === undefined ? pattern.ledState : stateOverride;
+function setLed(patternKey, nextState, elapsedMs = 0) {
+  const pattern = LED_PREVIEWS[patternKey] ?? LED_PREVIEWS.idle;
   const signature = `${patternKey}:${JSON.stringify(nextState)}`;
   if (signature !== `${activeLedPatternKey}:${JSON.stringify(activeLedState)}`) {
     activeLedPatternKey = patternKey;
@@ -601,7 +747,6 @@ function setLed(patternKey, stateOverride = undefined, elapsedMs = 0) {
   orb.setAttribute('aria-label', `${pattern.name} LEDプレビュー`);
   $('ledPatternName').textContent = pattern.name;
   $('ledPatternDetail').textContent = pattern.detail;
-  for (const button of document.querySelectorAll('[data-pattern]')) button.dataset.active = String(button.dataset.pattern === patternKey);
 }
 
 function normalLedState(status) {
@@ -617,11 +762,7 @@ function normalLedState(status) {
 
 function renderLed() {
   const status = currentStatus();
-  $('ledSource').textContent = mode === 'live' ? '本体状態に連動' : mode === 'demo' ? 'デモ（送信なし）' : '本体状態なし';
-  if (mode === 'demo') {
-    setLed(demoPattern, PATTERNS[demoPattern]?.ledState);
-    return;
-  }
+  $('ledSource').textContent = mode === 'live' ? '本体状態に連動' : '本体状態なし';
   if (!status) {
     setLed('idle', null);
     return;
@@ -664,6 +805,7 @@ function paintLedFrame(now) {
 }
 
 function render() {
+  $('rebootNotice').hidden = !currentStatus()?.needsReboot;
   renderConnection();
   renderNotice();
   renderOperation();
@@ -673,7 +815,7 @@ function render() {
   renderLegacyCards();
   renderConfiguration();
   renderLed();
-  $('forgetAllButton').disabled = !canSend();
+  $('forgetAllButton').disabled = !canChangeRegistration();
 }
 
 function appendLog(message, kind = '') {
@@ -687,8 +829,8 @@ function appendLog(message, kind = '') {
   root.scrollTop = root.scrollHeight;
 }
 
-async function sendCommand(command, label) {
-  if (!canSend()) return;
+async function sendCommand(command, label, { requiresUsb = false } = {}) {
+  if (!canSend() || (requiresUsb && transport === 'bluetooth') || !activeClient) return;
   busy = true;
   renderConnection();
   renderPcCards();
@@ -698,8 +840,10 @@ async function sendCommand(command, label) {
   renderConfiguration();
   appendLog(`送信: ${command}${label ? ` · ${label}` : ''}`);
   try {
-    await client.send(command);
-    lastResponse = { ok: true };
+    const response = await activeClient.send(command);
+    lastResponse = transport === 'bluetooth'
+      ? { ok: response.ok, error: response.error }
+      : { ok: true };
   } catch (error) {
     lastResponse = { ok: false, error: error.message };
     appendLog(`送信失敗: ${error.message}`, 'error');
@@ -710,8 +854,8 @@ async function sendCommand(command, label) {
 }
 
 function openDestructive(title, message, command) {
-  if (!isLive()) return;
-  pendingDestructive = { command, label: title };
+  if (!canChangeRegistration()) return;
+  pendingDestructive = { command, label: title, requiresUsb: true };
   $('dialogTitle').textContent = title;
   $('dialogMessage').textContent = message;
   $('dialogConfirm').textContent = '解除する';
@@ -720,7 +864,7 @@ function openDestructive(title, message, command) {
   else if (window.confirm(`${title}\n\n${message}`)) {
     const pending = pendingDestructive;
     pendingDestructive = null;
-    sendCommand(pending.command, pending.label);
+    sendCommand(pending.command, pending.label, { requiresUsb: pending.requiresUsb });
   }
 }
 
@@ -730,7 +874,9 @@ function handleDialogSubmit(event) {
   const pending = pendingDestructive;
   pendingDestructive = null;
   $('confirmDialog').close();
-  if (submitter === 'confirm' && pending) sendCommand(pending.command, pending.label);
+  if (submitter === 'confirm' && pending && canChangeRegistration()) {
+    sendCommand(pending.command, pending.label, { requiresUsb: pending.requiresUsb });
+  }
 }
 
 function onResponse(response) {
@@ -742,66 +888,83 @@ function onResponse(response) {
 
 store.subscribe(() => {
   const snapshot = store.snapshot();
-  if (mode !== 'demo') mode = snapshot.connected ? 'live' : 'disconnected';
+  mode = snapshot.connected ? 'live' : 'disconnected';
   render();
 });
-client.on('connected', () => { mode = 'live'; appendLog('シリアル接続: 115200 bps', 'ok'); render(); });
-client.on('disconnected', () => { mode = 'disconnected'; appendLog('シリアル接続が切れました。古い状態を消去しました。', 'error'); render(); });
-client.on('status', (status) => { appendLog(`status: PC${status.selectedPc} / UI ${status.ui.state}`); });
-client.on('response', onResponse);
-client.on('line', (event) => {
-  if (event.kind === 'log') appendLog(`ログ: ${event.line}`);
-  if (event.kind === 'invalid-json') appendLog(`無効なJSONを無視: ${event.line}`, 'error');
-});
-client.on('error', (error) => { lastResponse = { ok: false, error: error.message }; appendLog(`通信エラー: ${error.message}`, 'error'); render(); });
+function bindClient(client, kind) {
+  client.on('connected', () => {
+    if (activeClient !== client) return;
+    mode = 'live';
+    appendLog(kind === 'bluetooth' ? 'Bluetooth設定サービスに接続しました。' : 'USBシリアル接続: 115200 bps', 'ok');
+    render();
+  });
+  client.on('disconnected', () => {
+    if (activeClient === client) {
+      activeClient = null;
+      transport = null;
+    }
+    mode = store.snapshot().connected ? 'live' : 'disconnected';
+    appendLog('接続が切れました。古い状態を消去しました。', 'error');
+    render();
+  });
+  client.on('status', (status) => { appendLog(`status: PC${status.selectedPc} / UI ${status.ui.state}`); });
+  client.on('response', onResponse);
+  client.on('line', (event) => {
+    if (event.kind === 'log') appendLog(`ログ: ${event.line}`);
+    if (event.kind === 'invalid-json') appendLog(`無効なJSONを無視: ${event.line}`, 'error');
+  });
+  client.on('error', (error) => {
+    lastResponse = { ok: false, error: error.message };
+    appendLog(`通信エラー: ${error.message}`, 'error');
+    render();
+  });
+}
 
-$('connectButton').addEventListener('click', async () => {
-  if (mode === 'demo') { mode = 'disconnected'; demoStatus = null; render(); return; }
+bindClient(bluetoothClient, 'bluetooth');
+bindClient(usbClient, 'usb');
+
+async function connectUsing(client, kind) {
   if (busy) return;
   busy = true;
+  const previous = activeClient;
+  if (previous && previous !== client) await previous.disconnect().catch(() => undefined);
+  activeClient = client;
+  transport = kind;
   renderConnection();
   try {
     await client.connect();
     mode = 'live';
   } catch (error) {
     mode = 'disconnected';
+    activeClient = null;
+    transport = null;
     lastResponse = { ok: false, error: error.message };
     appendLog(`接続失敗: ${error.message}`, 'error');
   } finally {
     busy = false;
     render();
   }
-});
+}
+
+$('connectButton').addEventListener('click', () => connectUsing(bluetoothClient, 'bluetooth'));
+$('usbConnectButton').addEventListener('click', () => connectUsing(usbClient, 'usb'));
 
 $('disconnectButton').addEventListener('click', async () => {
   if (busy) return;
   busy = true;
   renderConnection();
-  await client.disconnect();
-  busy = false;
-  mode = 'disconnected';
-  render();
-});
-
-$('demoButton').addEventListener('click', () => {
-  if (mode === 'demo') {
+  try {
+    await activeClient?.disconnect();
+  } catch (error) {
+    appendLog(`切断失敗: ${error.message}`, 'error');
+  } finally {
+    activeClient = null;
+    transport = null;
     mode = 'disconnected';
-    demoStatus = null;
-  } else {
-    mode = 'demo';
-    demoStatus = makeDemoStatus();
-    demoPattern = 'pc1';
+    busy = false;
+    render();
   }
-  render();
 });
-
-for (const button of document.querySelectorAll('[data-pattern]')) {
-  button.addEventListener('click', () => {
-    if (mode !== 'demo') return;
-    demoPattern = button.dataset.pattern;
-    renderLed();
-  });
-}
 
 $('cancelButton').addEventListener('click', () => sendCommand(buildCommand('cancel'), '本体処理の中止'));
 $('forgetAllButton').addEventListener('click', () => openDestructive('全登録を解除しますか？', 'PC3台と入力4枠の登録情報を解除します。配列などの設定は変更しません。', buildCommand('forget', 'all')));
@@ -823,11 +986,11 @@ function renderConfirmAction() {
   const status = currentStatus();
   if (!isLive() || !status || status.ui.state !== 'confirm' || status.ui.confirmationId <= 0) return;
   const button = makeButton('確認して続ける', 'button-primary', {
-    disabled: !canSend(),
-    onClick: () => sendCommand(buildCommand('confirm', status.ui.confirmationId), '入れ替えの確定'),
+    disabled: !canChangeRegistration(),
+    onClick: () => sendCommand(buildCommand('confirm', status.ui.confirmationId), '入れ替えの確定', { requiresUsb: true }),
   });
   button.id = 'confirmOperationButton';
-  button.title = '古い登録を削除して新しい登録待ちにします。失敗・中止の場合は未登録のままです。';
+  button.title = '新しい機器の登録を始めます。別機器への入れ替えは登録の保存後に反映し、中止・失敗・時間切れ・bond保存満杯では前の登録を保ちます。同じ機器の鍵交換後は新しい鍵を使います。';
   meta.prepend(button);
 }
 

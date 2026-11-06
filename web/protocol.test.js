@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 
 import {
   classifyResult,
+  BluetoothClient,
   DeviceStateStore,
   describeError,
   describeOperation,
@@ -12,12 +13,15 @@ import {
   LineParser,
   SerialClient,
   SerialCommandWriter,
+  BLE_CONFIG_SERVICE_UUID,
   STATUS_STALE_AFTER_MS,
   buildCommand,
   buttonOrderChoices,
   buttonOrderLabel,
+  configurationFieldPolicy,
   normalizeStatus,
   rgbAt,
+  switchKeysProblem,
 } from './protocol.js';
 
 const status = {
@@ -56,19 +60,29 @@ function makeFakeClock() {
       timers.set(id, { callback, interval, next: now + interval });
       return id;
     },
+    setTimeout(callback, delay) {
+      const id = ++nextId;
+      timers.set(id, { callback, interval: null, next: now + delay });
+      return id;
+    },
     clearInterval(id) {
+      timers.delete(id);
+    },
+    clearTimeout(id) {
       timers.delete(id);
     },
     tick(milliseconds) {
       const target = now + milliseconds;
       while (true) {
-        const due = [...timers.values()]
-          .filter((timer) => timer.next <= target)
-          .sort((left, right) => left.next - right.next)[0];
+        const due = [...timers.entries()]
+          .filter(([, timer]) => timer.next <= target)
+          .sort((left, right) => left[1].next - right[1].next)[0];
         if (!due) break;
-        now = due.next;
-        due.callback();
-        due.next += due.interval;
+        const [id, timer] = due;
+        now = timer.next;
+        if (timer.interval === null) timers.delete(id);
+        else timer.next += timer.interval;
+        timer.callback();
       }
       now = target;
     },
@@ -108,6 +122,131 @@ async function flushMicrotasks() {
   await new Promise((resolve) => setTimeout(resolve, 0));
 }
 
+function makeFakeBleDevice({ name = 'HID Hub', onWrite = null } = {}) {
+  const writes = [];
+  const listeners = new Map();
+  let autoRespond = true;
+  let failNextConnect = false;
+  const txListeners = new Map();
+
+  const tx = {
+    async startNotifications() { return this; },
+    addEventListener(type, listener) {
+      const set = txListeners.get(type) ?? new Set();
+      set.add(listener);
+      txListeners.set(type, set);
+    },
+    removeEventListener(type, listener) { txListeners.get(type)?.delete(listener); },
+    notify(text, splitAt = null) {
+      const bytes = new TextEncoder().encode(text);
+      const ranges = splitAt === null ? [[0, bytes.length]] : [[0, splitAt], [splitAt, bytes.length]];
+      for (const [start, end] of ranges) {
+        if (start === end) continue;
+        const chunk = bytes.slice(start, end);
+        const value = new DataView(chunk.buffer, chunk.byteOffset, chunk.byteLength);
+        for (const listener of txListeners.get('characteristicvaluechanged') ?? []) {
+          listener({ target: { value } });
+        }
+      }
+    },
+    respondStatus() {
+      const response = `${JSON.stringify(status)}\n{"ok":true}\n`;
+      this.notify(response, 23);
+    },
+    respondOk() { this.notify('{"ok":true}\n'); },
+  };
+
+  const rx = {
+    async writeValueWithResponse(bytes) {
+      const line = new TextDecoder().decode(bytes);
+      writes.push(line);
+      if (onWrite) await onWrite(line, tx);
+      else if (autoRespond) {
+        if (line === 'status\n') tx.respondStatus();
+        else tx.respondOk();
+      }
+    },
+  };
+  const service = {
+    async getCharacteristic(uuid) {
+      if (uuid === 'f702bda6-2d20-4f9b-97de-1074f69db11a') return rx;
+      if (uuid === 'f702bda7-2d20-4f9b-97de-1074f69db11a') return tx;
+      throw new Error(`unexpected characteristic ${uuid}`);
+    },
+  };
+  const server = {
+    async getPrimaryService(uuid) {
+      assert.equal(uuid, BLE_CONFIG_SERVICE_UUID);
+      return service;
+    },
+  };
+  const gatt = {
+    connected: false,
+    connectAttempts: 0,
+    disconnectCalls: 0,
+    async connect() {
+      this.connectAttempts += 1;
+      if (failNextConnect) {
+        failNextConnect = false;
+        throw new Error('saved GATT link unavailable');
+      }
+      this.connected = true;
+      return server;
+    },
+    disconnect() {
+      this.disconnectCalls += 1;
+      this.connected = false;
+      for (const listener of listeners.get('gattserverdisconnected') ?? []) {
+        listener({ target: device });
+      }
+    },
+  };
+  const device = {
+    id: `${name}-id`,
+    name,
+    gatt,
+    addEventListener(type, listener) {
+      const set = listeners.get(type) ?? new Set();
+      set.add(listener);
+      listeners.set(type, set);
+    },
+    removeEventListener(type, listener) { listeners.get(type)?.delete(listener); },
+    disconnectRemote() { gatt.disconnect(); },
+  };
+  device.writes = writes;
+  device.tx = tx;
+  device.setAutoRespond = (value) => { autoRespond = value; };
+
+  return {
+    device,
+    tx,
+    writes,
+    setAutoRespond(value) { autoRespond = value; },
+    failNextConnect() { failNextConnect = true; },
+  };
+}
+
+function makeFakeBluetooth({ permittedDevices = [], chooserDevice = makeFakeBleDevice().device } = {}) {
+  const calls = { getDevices: 0, requestDevice: 0, requestOptions: null };
+  return {
+    calls,
+    device: chooserDevice,
+    writes: chooserDevice.writes,
+    bluetooth: {
+      async getDevices() {
+        calls.getDevices += 1;
+        return permittedDevices;
+      },
+      async requestDevice(options) {
+        calls.requestDevice += 1;
+        calls.requestOptions = options;
+        if (!chooserDevice) throw new Error('no chooser device');
+        return chooserDevice;
+      },
+    },
+  };
+}
+
 test('LineParser handles split JSON, multiple lines, logs, and invalid JSON', () => {
   const parser = new LineParser();
   assert.deepEqual(parser.push('log boot\n{"protocol":2,"selectedPc":1'), [
@@ -128,6 +267,7 @@ test('normalizeStatus validates protocol v2 while preserving null names', () => 
   assert.equal(normalized.pcs[0].name, null);
   assert.equal(normalized.inputs[1].slot, null);
   assert.equal(normalized.legacyInputs[0].slot, 4);
+  assert.equal(normalized.needsReboot, false, 'older firmware status remains compatible');
   assert.equal(normalized.candidateGeneration, 0);
   assert.deepEqual(normalized.candidates, []);
   assert.equal(normalized.ui.resultRemainingMs, 0);
@@ -140,6 +280,29 @@ test('normalizeStatus validates protocol v2 while preserving null names', () => 
     ...status,
     ui: { ...status.ui, state: 'confirm', target: 'pc1', operation: 'forget', confirmationId: 0 },
   }), /confirmationId/i);
+});
+
+test('normalizeStatus carries reboot and keyboard interval policy status', () => {
+  const normalized = normalizeStatus({
+    ...status,
+    needsReboot: true,
+    inputs: status.inputs.map((entry, index) => index === 0
+      ? { ...entry, intervalPolicyGaveUp: true, peerIntervalRejections: 7 }
+      : entry),
+  });
+  assert.equal(normalized.needsReboot, true);
+  assert.equal(normalized.inputs[0].intervalPolicyGaveUp, true);
+  assert.equal(normalized.inputs[0].peerIntervalRejections, 7);
+  const withLegacyCount = normalizeStatus({
+    ...status,
+    legacyInputs: [{ slot: 4, registered: true, connected: false, intervalPolicyGaveUp: false, peerIntervalRejections: 3 }],
+  });
+  assert.equal(withLegacyCount.legacyInputs[0].peerIntervalRejections, 3);
+  assert.throws(() => normalizeStatus({ ...status, needsReboot: 1 }), /needsReboot/i);
+  assert.throws(() => normalizeStatus({
+    ...status,
+    inputs: status.inputs.map((entry, index) => index === 0 ? { ...entry, peerIntervalRejections: -1 } : entry),
+  }), /peerIntervalRejections/i);
 });
 
 test('normalizeStatus preserves optional fast interval status for PCs and mouse inputs', () => {
@@ -171,8 +334,14 @@ test('normalizeStatus preserves optional fast interval status for PCs and mouse 
 
   assert.deepEqual(normalized.pcs[0].fast, pcFast);
   assert.deepEqual(normalized.inputs[2].fast, inputFast);
+  assert.equal(normalized.pcs[0].intervalUs, 11250);
+  assert.equal(normalized.inputs[0].intervalUs, 7500);
   assert.equal(normalized.inputs[0].fast, undefined);
   assert.equal(normalizeStatus(status).pcs[0].fast, undefined, 'status from older firmware remains valid');
+  assert.throws(() => normalizeStatus({
+    ...status,
+    pcs: status.pcs.map((entry, index) => index === 0 ? { ...entry, intervalUs: -1 } : entry),
+  }), /intervalUs/i);
 });
 
 test('normalizeStatus accepts bounded candidates with a positive generation', () => {
@@ -201,6 +370,7 @@ test('user-facing mappers hide protocol error and operation codes', () => {
   assert.equal(describeOperation('forget'), '登録解除');
   assert.equal(describeResult('success'), '処理が完了しました。');
   assert.equal(describeResult('timeout'), '時間切れです。登録は完了していません。');
+  assert.equal(describeResult('bond-store-full'), '本体のbond保存領域が満杯です。新しい登録は完了せず、以前の登録は保持されています。');
   assert.equal(describeResult('confirmation-timeout'), '確認の時間が切れました。登録は変更していません。');
   assert.equal(describeResult('input_pairing_unavailable'), '入力機器の登録を開始できませんでした。');
   assert.equal(describeResult('本体が応答しませんでした。'), '本体が応答しませんでした。');
@@ -214,6 +384,7 @@ test('classifyResult keeps success, failure, and cancellation LED meanings disti
   assert.equal(classifyResult('failure'), 'failure');
   assert.equal(classifyResult('timeout'), 'failure');
   assert.equal(classifyResult('busy'), 'failure');
+  assert.equal(classifyResult('bond-store-full'), 'failure');
   assert.equal(classifyResult('cancelled'), 'cancelled');
   assert.equal(classifyResult('confirmation-timeout'), 'cancelled');
   assert.equal(classifyResult('some_other_result'), 'none');
@@ -227,6 +398,191 @@ test('DeviceStateStore clears live status on disconnect', () => {
   assert.equal(store.snapshot().status.selectedPc, 2);
   store.markDisconnected();
   assert.deepEqual(store.snapshot(), { connected: false, status: null });
+});
+
+test('BluetoothClient joins split notifications into status and shares the USB state store', async () => {
+  const clock = makeFakeClock();
+  const fake = makeFakeBluetooth();
+  const store = new DeviceStateStore();
+  const bluetoothClient = new BluetoothClient({ bluetooth: fake.bluetooth, store, clock });
+  const usbClient = new SerialClient({ serial: null, store, clock });
+
+  await bluetoothClient.connect();
+
+  assert.strictEqual(bluetoothClient.store, usbClient.store);
+  assert.equal(store.snapshot().connected, true);
+  assert.equal(store.snapshot().status.selectedPc, 2);
+  assert.deepEqual(fake.writes, ['status\n']);
+  assert.deepEqual(fake.calls.requestOptions, {
+    filters: [{ services: [BLE_CONFIG_SERVICE_UUID] }],
+  });
+  await bluetoothClient.disconnect();
+});
+
+test('BluetoothClient opens the service chooser without calling unsupported getDevices', async () => {
+  const clock = makeFakeClock();
+  const fake = makeFakeBluetooth();
+  const bluetooth = { requestDevice: fake.bluetooth.requestDevice };
+  const client = new BluetoothClient({ bluetooth, clock });
+
+  await client.connect();
+
+  assert.equal(fake.calls.getDevices, 0);
+  assert.equal(fake.calls.requestDevice, 1);
+  assert.deepEqual(fake.calls.requestOptions, {
+    filters: [{ services: [BLE_CONFIG_SERVICE_UUID] }],
+  });
+  await client.disconnect();
+});
+
+test('BluetoothClient times out the combined GATT connection and initial status wait after eight seconds', async () => {
+  const clock = makeFakeClock();
+  const fake = makeFakeBluetooth();
+  const store = new DeviceStateStore();
+  const client = new BluetoothClient({ bluetooth: fake.bluetooth, store, clock, commandTimeoutMs: 20000 });
+  fake.device.setAutoRespond(false);
+
+  const connectGatt = fake.device.gatt.connect.bind(fake.device.gatt);
+  let finishGattConnect;
+  fake.device.gatt.connect = () => new Promise((resolve, reject) => {
+    finishGattConnect = async () => {
+      try {
+        resolve(await connectGatt());
+      } catch (error) {
+        reject(error);
+      }
+    };
+  });
+
+  let connectionError = null;
+  let settled = false;
+  const connection = client.connect().catch((error) => {
+    connectionError = error;
+  }).finally(() => { settled = true; });
+
+  try {
+    await flushMicrotasks();
+    clock.tick(7000);
+    await finishGattConnect();
+    await flushMicrotasks();
+    assert.deepEqual(fake.writes, ['status\n']);
+    clock.tick(999);
+    await flushMicrotasks();
+    assert.equal(settled, false);
+    clock.tick(1);
+    await flushMicrotasks();
+
+    assert.equal(settled, true);
+    assert.equal(connectionError?.message, '接続できませんでした。機器の一覧に HID Hub が 2 つあるときは、もう一方を選んでください。');
+    assert.equal(fake.device.gatt.connected, false);
+    assert.equal(fake.device.gatt.disconnectCalls, 1);
+    assert.deepEqual(store.snapshot(), { connected: false, status: null });
+  } finally {
+    if (!settled) {
+      clock.tick(30000);
+      await flushMicrotasks();
+    }
+    await connection;
+  }
+
+  fake.device.gatt.connect = connectGatt;
+  fake.device.setAutoRespond(true);
+  await client.connect();
+  assert.equal(store.snapshot().connected, true);
+  await client.disconnect();
+});
+
+test('BluetoothClient reuses a granted Hub first and falls back to the chooser if reconnect fails', async () => {
+  const clock = makeFakeClock();
+  const granted = makeFakeBleDevice();
+  const chooser = makeFakeBleDevice({ name: 'HID Hub Config' });
+  granted.failNextConnect();
+  const fake = makeFakeBluetooth({
+    permittedDevices: [granted.device],
+    chooserDevice: chooser.device,
+  });
+  const client = new BluetoothClient({ bluetooth: fake.bluetooth, clock });
+
+  await client.connect();
+
+  assert.equal(granted.device.gatt.connectAttempts, 1);
+  assert.equal(chooser.device.gatt.connectAttempts, 1);
+  assert.equal(fake.calls.getDevices, 1);
+  assert.equal(fake.calls.requestDevice, 1);
+  assert.equal(client.device, chooser.device);
+  await client.disconnect();
+});
+
+test('BluetoothClient waits for each response and serializes user commands with status refreshes', async () => {
+  const clock = makeFakeClock();
+  const fake = makeFakeBluetooth();
+  const client = new BluetoothClient({ bluetooth: fake.bluetooth, clock });
+  await client.connect();
+  fake.device.setAutoRespond(false);
+
+  const select = client.send('select 2');
+  const setButtons = client.send('set buttons M321');
+  const cancel = client.send('cancel');
+  await flushMicrotasks();
+  assert.deepEqual(fake.device.writes, ['status\n', 'select 2\n']);
+  assert.deepEqual(fake.calls, {
+    getDevices: 1,
+    requestDevice: 1,
+    requestOptions: {
+      filters: [{ services: [BLE_CONFIG_SERVICE_UUID] }],
+    },
+  });
+  fake.device.tx.respondOk();
+  await flushMicrotasks();
+  assert.deepEqual(fake.device.writes, ['status\n', 'select 2\n', 'status\n']);
+  fake.device.tx.respondStatus();
+  await flushMicrotasks();
+  assert.deepEqual(fake.device.writes, ['status\n', 'select 2\n', 'status\n', 'set buttons M321\n']);
+  fake.device.tx.respondOk();
+  await flushMicrotasks();
+  fake.device.tx.respondStatus();
+  await flushMicrotasks();
+  assert.deepEqual(fake.device.writes, [
+    'status\n', 'select 2\n', 'status\n', 'set buttons M321\n', 'status\n', 'cancel\n',
+  ]);
+  fake.device.tx.respondOk();
+  await flushMicrotasks();
+  fake.device.tx.respondStatus();
+  await Promise.all([select, setButtons, cancel]);
+  await client.disconnect();
+});
+
+test('BluetoothClient disconnect event clears status and stops sends', async () => {
+  const clock = makeFakeClock();
+  const fake = makeFakeBluetooth();
+  const store = new DeviceStateStore();
+  const client = new BluetoothClient({ bluetooth: fake.bluetooth, store, clock });
+  let disconnected = 0;
+  client.on('disconnected', () => { disconnected += 1; });
+  await client.connect();
+
+  fake.device.disconnectRemote();
+  await flushMicrotasks();
+
+  assert.equal(disconnected, 1);
+  assert.deepEqual(store.snapshot(), { connected: false, status: null });
+  await assert.rejects(client.send('status'), /not connected/i);
+});
+
+test('BluetoothClient sends the next periodic status five seconds after the full response', async () => {
+  const clock = makeFakeClock();
+  const fake = makeFakeBluetooth();
+  const client = new BluetoothClient({ bluetooth: fake.bluetooth, clock });
+  await client.connect();
+
+  clock.tick(4999);
+  await flushMicrotasks();
+  assert.deepEqual(fake.device.writes, ['status\n']);
+
+  clock.tick(1);
+  await flushMicrotasks();
+  assert.deepEqual(fake.device.writes, ['status\n', 'status\n']);
+  await client.disconnect();
 });
 
 test('buildCommand emits exact v2 commands and rejects injection', () => {
@@ -254,9 +610,9 @@ test('buildCommand emits exact v2 commands and rejects injection', () => {
 test('slot selection breathes in cyan, while each input pairing retains its pulse count', () => {
   assert.deepEqual(rgbAt({ state: 'select-slot' }, 0), LED_COLORS.off);
   assert.deepEqual(rgbAt({ state: 'select-slot' }, 500), [0, 12, 12]);
-  assert.deepEqual(rgbAt({ state: 'select-slot' }, 1000), LED_COLORS.mouse);
+  assert.deepEqual(rgbAt({ state: 'select-slot' }, 1000), LED_COLORS.selectSlot);
   assert.deepEqual(rgbAt({ state: 'select-slot' }, 1500), [0, 12, 12]);
-  for (const [target, count, color] of [['k1', 1, LED_COLORS.keyboard], ['k2', 2, LED_COLORS.keyboard], ['m1', 3, LED_COLORS.mouse], ['m2', 4, LED_COLORS.mouse]]) {
+  for (const [target, count, color] of [['k1', 1, LED_COLORS.keyboard], ['k2', 2, LED_COLORS.keyboard], ['m1', 1, LED_COLORS.mouse], ['m2', 2, LED_COLORS.mouse]]) {
     const state = { state: 'pairing', target };
     assert.deepEqual(rgbAt(state, (count - 1) * 300), color);
     assert.deepEqual(rgbAt(state, count * 300), LED_COLORS.off);
@@ -399,10 +755,41 @@ test('SerialClient clears stale state when the read loop closes unexpectedly', a
 
 test('configuration status preserves independent PC OS and layout and four physical layouts', () => {
   const config = { inputLayouts: ['us', 'jis', 'us', 'jis'], outputLayouts: ['jis', 'us', 'us'], outputOs: ['windows', 'macos', 'unspecified'] };
-  assert.deepEqual(normalizeStatus({ ...status, config }).config, { ...config, buttonOrder: null });
+  assert.deepEqual(normalizeStatus({ ...status, config }).config, {
+    ...config,
+    inputMacDeleteSwap: [false, false, false, false],
+    inputMacDeleteSwapSupported: false,
+    buttonOrder: null,
+  });
   assert.equal(normalizeStatus(status).config, null, 'old firmware must not invent saved settings');
   for (const bad of [ { ...config, outputOs: ['auto', 'macos', 'linux'] }, { ...config, inputLayouts: ['us'] }, { ...config, outputLayouts: ['us', 'jis', 'dvorak'] } ]) {
     assert.throws(() => normalizeStatus({ ...status, config: bad }));
+  }
+});
+
+test('configuration status preserves four physical Mac Delete and Back Space swap settings', () => {
+  const config = {
+    inputLayouts: ['us', 'jis', 'us', 'jis'],
+    inputMacDeleteSwap: [false, true, false, true],
+    outputLayouts: ['jis', 'us', 'us'],
+    outputOs: ['windows', 'macos', 'unspecified'],
+  };
+  assert.deepEqual(normalizeStatus({ ...status, config }).config, {
+    ...config,
+    inputMacDeleteSwapSupported: true,
+    buttonOrder: null,
+  });
+  assert.deepEqual(
+    normalizeStatus({ ...status, config: { ...config, inputMacDeleteSwap: undefined } }).config.inputMacDeleteSwap,
+    [false, false, false, false],
+    'firmware without this setting defaults every physical input off',
+  );
+  assert.equal(
+    normalizeStatus({ ...status, config: { ...config, inputMacDeleteSwap: undefined } }).config.inputMacDeleteSwapSupported,
+    false,
+  );
+  for (const bad of [[true, false], [false, 1, false, false], ['off', false, false, false]]) {
+    assert.throws(() => normalizeStatus({ ...status, config: { ...config, inputMacDeleteSwap: bad } }));
   }
 });
 
@@ -435,6 +822,27 @@ test('button order choices display presets and preserve a custom saved value', (
   assert.equal(buttonOrderLabel('2M13'), '2M13');
 });
 
+test('button order editing over Bluetooth is disabled and points users to USB', () => {
+  assert.deepEqual(configurationFieldPolicy('buttons', 'bluetooth'), {
+    disabled: true,
+    guidance: 'Bluetooth接続中はボタンの並びを変更できません。USBで接続してください。',
+  });
+  assert.deepEqual(configurationFieldPolicy('buttons', 'usb'), {
+    disabled: false,
+    guidance: '',
+  });
+  assert.deepEqual(configurationFieldPolicy('pc', 'bluetooth'), {
+    disabled: false,
+    guidance: '',
+  });
+  for (const transport of ['bluetooth', 'usb']) {
+    assert.deepEqual(configurationFieldPolicy('input', transport), {
+      disabled: false,
+      guidance: '',
+    });
+  }
+});
+
 test('configuration commands validate layouts, destination OS, and physical input slots', () => {
   assert.equal(buildCommand('set', 'pc', 2, 'layout', 'jis'), 'set pc 2 layout jis');
   assert.equal(buildCommand('set', 'input', 4, 'layout', 'us'), 'set input 4 layout us');
@@ -443,5 +851,40 @@ test('configuration commands validate layouts, destination OS, and physical inpu
   }
   for (const args of [['input', 1, 'os', 'windows'], ['pc', 0, 'os', 'macos'], ['pc', 1, 'os', 'auto'], ['input', 'k1', 'layout', 'us'], ['pc', 1, 'layout', 'us\nforget all']]) {
     assert.throws(() => buildCommand('set', ...args));
+  }
+});
+
+test('configuration commands build Mac Delete and Back Space swap changes for physical inputs', () => {
+  assert.equal(buildCommand('set', 'input', 1, 'mac-delete-swap', 'on'), 'set input 1 mac-delete-swap on');
+  assert.equal(buildCommand('set', 'input', 4, 'mac-delete-swap', 'off'), 'set input 4 mac-delete-swap off');
+  for (const args of [
+    ['input', 0, 'mac-delete-swap', 'on'],
+    ['input', 5, 'mac-delete-swap', 'off'],
+    ['pc', 1, 'mac-delete-swap', 'on'],
+    ['input', 1, 'mac-delete-swap', 'yes'],
+  ]) {
+    assert.throws(() => buildCommand('set', ...args));
+  }
+});
+
+
+test('PC switch shortcut keys: command, validation and status', () => {
+  assert.equal(buildCommand('set-shortcut-keys', ['a', 's', 'd']), 'set shortcut-keys a,s,d');
+  assert.equal(buildCommand('set-shortcut-keys', ['q', 'f5', '7']), 'set shortcut-keys q,f5,7');
+  for (const bad of [['a', 'a', 'd'], ['a', 's'], ['a', 's', 'd', 'f'], ['a', 's', 'space'], ['A', 's', 'd'], 'a,s,d']) {
+    assert.throws(() => buildCommand('set-shortcut-keys', bad), bad.toString());
+  }
+  assert.equal(buildCommand('set-shortcut-default'), 'set shortcut ctrl-alt-shift-digits');
+  assert.equal(switchKeysProblem(['a', 's', 'd']), null);
+  assert.match(switchKeysProblem(['a', 'a', 'd']), /同じキー/);
+  const config = { inputLayouts: ['us', 'jis', 'us', 'jis'], outputLayouts: ['jis', 'us', 'us'], outputOs: ['windows', 'macos', 'unspecified'] };
+  const keys = normalizeStatus({ ...status, config: { ...config, shortcut: 'ctrl-alt-shift-keys', shortcutKeys: ['a', 's', 'd'] } }).config;
+  assert.deepEqual(keys.shortcutKeys, ['a', 's', 'd']);
+  assert.equal(keys.shortcut, 'ctrl-alt-shift-keys');
+  const other = normalizeStatus({ ...status, config: { ...config, shortcut: 'ctrl-alt-shift-digits', shortcutKeys: [] } }).config;
+  assert.deepEqual(other.shortcutKeys, []);
+  assert.equal(normalizeStatus({ ...status, config }).config.shortcutKeys, undefined, 'older firmware has no shortcut keys');
+  for (const bad of [['a', 'a', 'd'], ['a', 's'], ['a', 's', 'space']]) {
+    assert.throws(() => normalizeStatus({ ...status, config: { ...config, shortcut: 'x', shortcutKeys: bad } }));
   }
 });
